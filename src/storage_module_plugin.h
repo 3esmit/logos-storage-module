@@ -331,6 +331,9 @@ public:
     /// must not equal `cid`. `maxDownloadBytes` must be positive and no larger
     /// than the limit advertised by downloadProtocol(). The manifest is checked
     /// before the download starts; oversized content is rejected before dispatch.
+    /// Content is written to a sibling staging file and replaces `filePath` only
+    /// after a successful terminal result. Failed or canceled downloads preserve
+    /// a pre-existing destination file.
     ///
     /// Returns an acknowledgement map on success:
     /// @code{.json}
@@ -355,7 +358,9 @@ public:
     ///
     /// The response identifies the operation and one of `canceled`,
     /// `already_terminal`, or `not_found`. An `already_terminal` response also
-    /// includes its `terminalOutcome`.
+    /// includes its `terminalOutcome`. Invalid arguments and cancellation
+    /// dispatch failures return an unsuccessful StdLogosResult instead of a
+    /// cancellation-status map.
     StdLogosResult downloadCancelV2(const std::string& operationId);
 
     /// Check whether content identified by CID exists in local storage.
@@ -574,7 +579,8 @@ private:
     std::vector<DownloadV2Worker> downloadV2Workers;
 
     void runDownloadV2(const std::shared_ptr<DownloadV2State>& state,
-                       const std::string& filePath, int chunkSize,
+                       const std::string& stagingPath,
+                       const std::string& destinationPath, int chunkSize,
                        uint64_t expectedBytes, uint64_t maxBytes);
     void finishDownloadV2(const std::shared_ptr<DownloadV2State>& state,
                           const std::string& outcome,

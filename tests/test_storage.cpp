@@ -577,7 +577,10 @@ LOGOS_TEST(downloadToUrlV2_acknowledges_and_emits_correlated_terminal_event) {
     t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
     constexpr char kPayload[] = "0123456789abcdef0123456789abcdef";
     const std::string path = "/tmp/logos-storage-v2-success";
-    fs::remove(path);
+    {
+        std::ofstream existing(path, std::ios::binary | std::ios::trunc);
+        existing << "existing backup";
+    }
     mockStorageSetNextDownloadChunkPayload(kPayload);
 
     const StdLogosResult result = impl->downloadToUrlV2(
@@ -641,7 +644,10 @@ LOGOS_TEST(downloadToUrlV2_cancel_reports_canceled_terminal_outcome) {
     auto* impl = createInitializedImpl(t);
     t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
     const std::string path = "/tmp/logos-storage-v2-canceled";
-    fs::remove(path);
+    {
+        std::ofstream existing(path, std::ios::binary | std::ios::trunc);
+        existing << "existing backup";
+    }
     mockStorageHoldNextDownloadChunk();
 
     const StdLogosResult start = impl->downloadToUrlV2(
@@ -662,6 +668,11 @@ LOGOS_TEST(downloadToUrlV2_cancel_reports_canceled_terminal_outcome) {
     LOGOS_ASSERT_EQ(terminal.at("outcome").get<std::string>(),
                     std::string("canceled"));
     LOGOS_ASSERT_FALSE(terminal.contains("error"));
+
+    std::ifstream destination(path, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(destination)),
+                               std::istreambuf_iterator<char>());
+    LOGOS_ASSERT_EQ(contents, std::string("existing backup"));
 
     impl->destroy();
     delete impl;
@@ -723,6 +734,37 @@ LOGOS_TEST(downloadToUrlV2_reports_terminal_failure_after_chunk_dispatch_failure
     LOGOS_ASSERT_TRUE(cancel.success);
     LOGOS_ASSERT_EQ(cancel.value.at("cancelStatus").get<std::string>(),
                     std::string("already_terminal"));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
+}
+
+LOGOS_TEST(downloadToUrlV2_preserves_existing_destination_after_failure) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    t.mockCFunction("storage_download_chunk").returns(1);
+    const std::string path = "/tmp/logos-storage-v2-preserved-destination";
+    {
+        std::ofstream existing(path, std::ios::binary | std::ios::trunc);
+        existing << "existing backup";
+    }
+
+    const StdLogosResult start = impl->downloadToUrlV2(
+        "QmPreservedCid", path, false, 65536,
+        "download-operation-preserve", 64);
+    LOGOS_ASSERT_TRUE(start.success);
+    const auto event = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(event.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(event.data).at("outcome").get<std::string>(),
+                    std::string("failed"));
+
+    std::ifstream destination(path, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(destination)),
+                               std::istreambuf_iterator<char>());
+    LOGOS_ASSERT_EQ(contents, std::string("existing backup"));
 
     impl->destroy();
     delete impl;

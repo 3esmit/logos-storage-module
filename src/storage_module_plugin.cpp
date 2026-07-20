@@ -158,6 +158,7 @@ static constexpr int DOWNLOAD_CANCEL_TIMEOUT_MS = 15000;
 static constexpr int DOWNLOAD_CHUNK_TIMEOUT_MS = 60000;
 static constexpr int MAX_DOWNLOAD_V2_BYTES = 1073741824;
 static constexpr size_t MAX_TERMINAL_DOWNLOADS_V2 = 128;
+static std::atomic<uint64_t> nextDownloadV2StagingFileId{0};
 
 static std::string fromMsg(const char* msg, size_t len) {
     return (msg && len > 0) ? std::string(msg, len) : std::string();
@@ -181,6 +182,16 @@ static bool manifestDatasetSize(const std::string& message, uint64_t& size) {
     } catch (...) {
     }
     return false;
+}
+
+static fs::path downloadV2StagingPath(const std::string& destinationPath) {
+    const fs::path destination(destinationPath);
+    const auto timestamp = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const uint64_t serial = nextDownloadV2StagingFileId.fetch_add(1);
+    return destination.parent_path()
+        / (destination.filename().string() + ".storage-download-"
+           + std::to_string(timestamp) + "-" + std::to_string(serial) + ".part");
 }
 
 struct SyncResult {
@@ -1145,13 +1156,14 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
         return {false, {}, "Download exceeds requested byte limit."};
     }
 
+    const fs::path stagingPath = downloadV2StagingPath(filePath);
     {
-        std::ofstream probe(filePath, std::ios::binary | std::ios::trunc);
+        std::ofstream probe(stagingPath, std::ios::binary | std::ios::trunc);
         if (!probe) {
             std::lock_guard<std::mutex> lock(downloadV2Mutex);
             pendingDownloadOperationIdsV2.erase(operationId);
             pendingDownloadCidsV2.erase(cid);
-            return {false, {}, "Failed to open download destination."};
+            return {false, {}, "Failed to open download staging file."};
         }
     }
 
@@ -1159,7 +1171,7 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
         storageCtx, storage_download_init, cid, static_cast<size_t>(chunkSize), local, 1000);
     if (!initialized.ok) {
         std::error_code ec;
-        fs::remove(filePath, ec);
+        fs::remove(stagingPath, ec);
         std::lock_guard<std::mutex> lock(downloadV2Mutex);
         pendingDownloadOperationIdsV2.erase(operationId);
         pendingDownloadCidsV2.erase(cid);
@@ -1180,7 +1192,7 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
         std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);
         downloadV2Workers.reserve(downloadV2Workers.size() + 1);
         std::thread worker(&StorageModuleImpl::runDownloadV2, this, state,
-                           filePath, chunkSize, manifestBytes,
+                           stagingPath.string(), filePath, chunkSize, manifestBytes,
                            static_cast<uint64_t>(maxDownloadBytes));
         downloadV2Workers.push_back({state, std::move(worker)});
     } catch (const std::exception&) {
@@ -1190,7 +1202,7 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
         }
         syncCallString(storageCtx, storage_download_cancel, cid, 1000);
         std::error_code ec;
-        fs::remove(filePath, ec);
+        fs::remove(stagingPath, ec);
         return {false, {}, "Failed to start versioned download worker."};
     }
 
@@ -1266,12 +1278,13 @@ StdLogosResult StorageModuleImpl::downloadCancelV2(const std::string& operationI
 }
 
 void StorageModuleImpl::runDownloadV2(
-    const std::shared_ptr<DownloadV2State>& state, const std::string& filePath,
-    int chunkSize, uint64_t expectedBytes, uint64_t maxBytes) {
-    std::ofstream output(filePath, std::ios::binary | std::ios::trunc);
-    auto removePartialFile = [&filePath] {
+    const std::shared_ptr<DownloadV2State>& state, const std::string& stagingPath,
+    const std::string& destinationPath, int chunkSize, uint64_t expectedBytes,
+    uint64_t maxBytes) {
+    std::ofstream output(stagingPath, std::ios::binary | std::ios::trunc);
+    auto removePartialFile = [&stagingPath] {
         std::error_code ec;
-        fs::remove(filePath, ec);
+        fs::remove(stagingPath, ec);
     };
     auto cancellationRequested = [&state] {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -1308,7 +1321,7 @@ void StorageModuleImpl::runDownloadV2(
     };
 
     if (!output) {
-        fail("Failed to open download destination.", true);
+        fail("Failed to open download staging file.", true);
         return;
     }
 
@@ -1365,6 +1378,15 @@ void StorageModuleImpl::runDownloadV2(
             if (cancellationRequested()) {
                 removePartialFile();
                 finishDownloadV2(state, "canceled");
+                return;
+            }
+            std::error_code renameError;
+            fs::rename(stagingPath, destinationPath, renameError);
+            if (renameError) {
+                removePartialFile();
+                finishDownloadV2(
+                    state, "failed",
+                    "Failed to replace download destination: " + renameError.message());
                 return;
             }
             finishDownloadV2(state, "succeeded");

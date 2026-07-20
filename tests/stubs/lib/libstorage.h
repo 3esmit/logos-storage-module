@@ -58,6 +58,8 @@ int storage_download_init(void *ctx, const char *cid, size_t chunkSize, bool loc
                           StorageCallback callback, void *userData);
 int storage_download_stream(void *ctx, const char *cid, size_t chunkSize, bool local,
                             const char *filepath, StorageCallback callback, void *userData);
+int storage_download_chunk(void *ctx, const char *cid, StorageCallback callback,
+                           void *userData);
 
 #ifdef __cplusplus
 }

@@ -8,9 +8,13 @@
 //   t.mockCFunction("storage_peer_id").returns("QmTestPeerId");
 
 #include <logos_clib_mock.h>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <condition_variable>
+#include <mutex>
+#include <string>
 
 #define RET_OK 0
 #define RET_ERR 1
@@ -20,6 +24,50 @@ typedef void (*StorageCallback)(int callerRet, const char *msg, size_t len, void
 
 // Sentinel address used as a fake non-null storage context.
 static char s_fakeCtx = 0;
+
+static std::mutex s_downloadChunkMutex;
+static std::condition_variable s_downloadChunkReady;
+static bool s_holdNextDownloadChunk = false;
+static StorageCallback s_heldDownloadChunkCallback = nullptr;
+static void* s_heldDownloadChunkUserData = nullptr;
+static std::string s_nextDownloadChunkPayload;
+
+void mockStorageSetNextDownloadChunkPayload(const char* payload) {
+    std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+    s_nextDownloadChunkPayload = payload ? payload : "";
+}
+
+void mockStorageHoldNextDownloadChunk() {
+    std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+    s_holdNextDownloadChunk = true;
+}
+
+bool mockStorageWaitForHeldDownloadChunk(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(s_downloadChunkMutex);
+    return s_downloadChunkReady.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [] {
+            return s_heldDownloadChunkCallback != nullptr;
+        });
+}
+
+void mockStorageCompleteHeldDownloadChunk(int result, const char* payload,
+                                          const char* message) {
+    StorageCallback callback = nullptr;
+    void* userData = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+        callback = s_heldDownloadChunkCallback;
+        userData = s_heldDownloadChunkUserData;
+        s_heldDownloadChunkCallback = nullptr;
+        s_heldDownloadChunkUserData = nullptr;
+    }
+    if (!callback) return;
+    if (payload && *payload) {
+        callback(RET_PROGRESS, payload, strlen(payload), userData);
+    }
+    const char* terminal = message ? message : "";
+    callback(result, terminal, strlen(terminal), userData);
+}
 
 // Helper: invoke callback with RET_OK and the string from the mock store.
 static void invokeOk(const char* funcName, StorageCallback cb, void* userData) {
@@ -223,6 +271,32 @@ int storage_download_stream(void* ctx, const char* cid, size_t chunkSize, bool l
     int rc = LOGOS_CMOCK_RETURN(int, "storage_download_stream");
     if (rc == RET_OK) invokeOk("storage_download_stream", cb, userData);
     return rc;
+}
+
+int storage_download_chunk(void* ctx, const char* cid, StorageCallback cb,
+                           void* userData) {
+    LOGOS_CMOCK_RECORD("storage_download_chunk");
+    std::string payload;
+    {
+        std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+        if (s_holdNextDownloadChunk) {
+            s_holdNextDownloadChunk = false;
+            s_heldDownloadChunkCallback = cb;
+            s_heldDownloadChunkUserData = userData;
+            s_downloadChunkReady.notify_all();
+            return RET_OK;
+        }
+        payload = std::move(s_nextDownloadChunkPayload);
+        s_nextDownloadChunkPayload.clear();
+    }
+
+    const int rc = LOGOS_CMOCK_RETURN(int, "storage_download_chunk");
+    if (rc != RET_OK) return rc;
+    if (cb && !payload.empty()) {
+        cb(RET_PROGRESS, payload.data(), payload.size(), userData);
+    }
+    if (cb) cb(RET_OK, "", 0, userData);
+    return RET_OK;
 }
 
 } // extern "C"

@@ -1,5 +1,6 @@
 #include "storage_module_plugin.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -8,8 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -149,9 +153,34 @@ static void syncCallback(int ret, const char* msg, size_t len, void* userData) {
 // ---------------------------------------------------------------------------
 
 static constexpr int64_t DEFAULT_CHUNK_SIZE = 65536;
+static constexpr int DOWNLOAD_PROTOCOL_VERSION = 2;
+static constexpr int DOWNLOAD_CANCEL_TIMEOUT_MS = 15000;
+static constexpr int DOWNLOAD_CHUNK_TIMEOUT_MS = 60000;
+static constexpr int MAX_DOWNLOAD_V2_BYTES = 1073741824;
+static constexpr size_t MAX_TERMINAL_DOWNLOADS_V2 = 128;
 
 static std::string fromMsg(const char* msg, size_t len) {
     return (msg && len > 0) ? std::string(msg, len) : std::string();
+}
+
+static bool manifestDatasetSize(const std::string& message, uint64_t& size) {
+    try {
+        const json manifest = json::parse(message);
+        const auto value = manifest.find("datasetSize");
+        if (value == manifest.end()) return false;
+        if (value->is_number_unsigned()) {
+            size = value->get<uint64_t>();
+            return true;
+        }
+        if (value->is_number_integer()) {
+            const int64_t signedSize = value->get<int64_t>();
+            if (signedSize < 0) return false;
+            size = static_cast<uint64_t>(signedSize);
+            return true;
+        }
+    } catch (...) {
+    }
+    return false;
 }
 
 struct SyncResult {
@@ -414,6 +443,182 @@ struct DownloadStreamCtx : AsyncCallbackBase {
     }
 };
 
+// A V2 transfer uses one libstorage chunk request at a time. This keeps the
+// storage worker free between chunks, which is necessary because libstorage
+// cannot cancel a stream-mode download while its worker is busy.
+struct DownloadV2State {
+    std::string cid;
+    std::string operationId;
+    std::mutex mutex;
+    std::condition_variable cancellationReady;
+    bool cancellationRequested = false;
+    bool cancellationDispatched = false;
+    bool cancellationResolved = false;
+    bool cancellationSucceeded = false;
+    std::string cancellationError;
+    std::atomic<bool> workerFinished{false};
+};
+
+struct DownloadV2CancelCtx {
+    std::shared_ptr<DownloadV2State> state;
+};
+
+static void downloadV2CancelCallback(int ret, const char* msg, size_t len,
+                                     void* userData) {
+    if (!userData || ret == RET_PROGRESS) return;
+    auto* ctx = static_cast<DownloadV2CancelCtx*>(userData);
+    {
+        std::lock_guard<std::mutex> lock(ctx->state->mutex);
+        ctx->state->cancellationResolved = true;
+        ctx->state->cancellationSucceeded = ret == RET_OK;
+        ctx->state->cancellationError = ret == RET_OK
+            ? std::string()
+            : fromMsg(msg, len);
+    }
+    ctx->state->cancellationReady.notify_all();
+    delete ctx;
+}
+
+static bool requestDownloadV2Cancellation(
+    void* storageCtx, const std::shared_ptr<DownloadV2State>& state) {
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->cancellationDispatched) return true;
+        state->cancellationDispatched = true;
+    }
+
+    auto resolveDispatchFailure = [&state](const std::string& error) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->cancellationResolved = true;
+            state->cancellationSucceeded = false;
+            state->cancellationError = error;
+        }
+        state->cancellationReady.notify_all();
+    };
+
+    if (!storageCtx) {
+        resolveDispatchFailure("Storage context not initialized.");
+        return false;
+    }
+
+    auto* ctx = new DownloadV2CancelCtx{state};
+    if (storage_download_cancel(storageCtx, state->cid.c_str(),
+                                downloadV2CancelCallback, ctx) != RET_OK) {
+        delete ctx;
+        resolveDispatchFailure("Failed to send download cancellation.");
+        return false;
+    }
+    return true;
+}
+
+static SyncResult waitForDownloadV2Cancellation(
+    const std::shared_ptr<DownloadV2State>& state) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->cancellationReady.wait_for(
+            lock, std::chrono::milliseconds(DOWNLOAD_CANCEL_TIMEOUT_MS),
+            [&state] { return state->cancellationResolved; })) {
+        return {false, "Timed out waiting for download cancellation."};
+    }
+    if (!state->cancellationSucceeded) {
+        return {false, state->cancellationError.empty()
+                ? "Storage download cancellation failed."
+                : state->cancellationError};
+    }
+    return {true, {}};
+}
+
+struct DownloadV2ChunkCtx {
+    explicit DownloadV2ChunkCtx(size_t limit) : maxBytes(limit) {}
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::vector<uint8_t> bytes;
+    size_t maxBytes;
+    int resultCode = RET_ERR;
+    std::string resultMessage;
+    bool completed = false;
+    bool exceededLimit = false;
+    std::atomic<bool> abandoned{false};
+};
+
+static void downloadV2ChunkCallback(int ret, const char* msg, size_t len,
+                                    void* userData) {
+    if (!userData) return;
+    auto* ctx = static_cast<DownloadV2ChunkCtx*>(userData);
+    if (ret == RET_PROGRESS) {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        if (ctx->completed || ctx->exceededLimit) return;
+        if ((!msg && len > 0) || len > ctx->maxBytes - ctx->bytes.size()) {
+            ctx->exceededLimit = true;
+            return;
+        }
+        if (len > 0) {
+            const auto* bytes = reinterpret_cast<const uint8_t*>(msg);
+            ctx->bytes.insert(ctx->bytes.end(), bytes, bytes + len);
+        }
+        return;
+    }
+
+    bool shouldDelete;
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->resultCode = ret;
+        ctx->resultMessage = fromMsg(msg, len);
+        ctx->completed = true;
+        ctx->ready.notify_all();
+        shouldDelete = ctx->abandoned.load();
+    }
+    if (shouldDelete) delete ctx;
+}
+
+struct DownloadV2ChunkResult {
+    bool dispatched = false;
+    bool completed = false;
+    bool succeeded = false;
+    bool exceededLimit = false;
+    std::vector<uint8_t> bytes;
+    std::string error;
+};
+
+static DownloadV2ChunkResult requestDownloadV2Chunk(void* storageCtx,
+                                                     const std::string& cid,
+                                                     size_t maxBytes) {
+    DownloadV2ChunkResult result;
+    if (!storageCtx) {
+        result.error = "Storage context not initialized.";
+        return result;
+    }
+
+    auto* ctx = new DownloadV2ChunkCtx(maxBytes);
+    if (storage_download_chunk(storageCtx, cid.c_str(), downloadV2ChunkCallback,
+                               ctx) != RET_OK) {
+        delete ctx;
+        result.error = "Failed to request download chunk.";
+        return result;
+    }
+    result.dispatched = true;
+
+    bool shouldDelete;
+    {
+        std::unique_lock<std::mutex> lock(ctx->mutex);
+        if (!ctx->ready.wait_for(lock, std::chrono::milliseconds(DOWNLOAD_CHUNK_TIMEOUT_MS),
+                                 [ctx] { return ctx->completed; })) {
+            ctx->abandoned.store(true);
+            result.error = "Timed out waiting for download chunk.";
+            return result;
+        }
+        result.completed = true;
+        result.succeeded = ctx->resultCode == RET_OK;
+        result.exceededLimit = ctx->exceededLimit;
+        result.bytes = std::move(ctx->bytes);
+        result.error = ctx->resultMessage;
+        shouldDelete = true;
+    }
+    if (shouldDelete) delete ctx;
+    return result;
+}
+
 // Handles a background manifest fetch.  The DHT lookup can take a
 // long time so it uses async callbacks to avoid blocking.
 //
@@ -559,6 +764,7 @@ StorageModuleImpl::StorageModuleImpl() : storageCtx(nullptr) {
 }
 
 StorageModuleImpl::~StorageModuleImpl() {
+    cancelAndJoinDownloadV2Workers();
     if (storageCtx) {
         fprintf(stderr,
                 "StorageModuleImpl: Warning - storage context was not "
@@ -622,6 +828,7 @@ StdLogosResult StorageModuleImpl::destroy() {
     fprintf(stderr, "StorageModuleImpl::destroy called\n");
     if (!storageCtx)
         return {false, {}, "Storage context not initialized."};
+    cancelAndJoinDownloadV2Workers();
     syncCallNoArg(storageCtx, storage_close, 1000);
     int ret = storage_destroy(storageCtx);
     if (ret == RET_OK) {
@@ -877,6 +1084,376 @@ StdLogosResult StorageModuleImpl::downloadCancel(const std::string& sessionId) {
     auto r = syncCallString(storageCtx, storage_download_cancel, sessionId, 1000);
     if (!r.ok) return {false, {}, r.message};
     return {true, {}, ""};
+}
+
+LogosMap StorageModuleImpl::downloadProtocol() {
+    return json{
+        {"protocol", "logos.storage.download"},
+        {"version", DOWNLOAD_PROTOCOL_VERSION},
+        {"moduleOperationIdOwner", "caller"},
+        {"cancelTimeoutMs", DOWNLOAD_CANCEL_TIMEOUT_MS},
+        {"maxDownloadBytes", MAX_DOWNLOAD_V2_BYTES},
+    };
+}
+
+StdLogosResult StorageModuleImpl::downloadToUrlV2(
+    const std::string& cid, const std::string& filePath, bool local,
+    int chunkSize, const std::string& operationId, int maxDownloadBytes) {
+    reapFinishedDownloadV2Workers();
+    if (!storageCtx) {
+        return {false, {}, "Storage context not initialized."};
+    }
+    if (cid.empty() || filePath.empty() || operationId.empty()
+        || operationId.find_first_of(" \t\r\n") != std::string::npos || operationId == cid
+        || chunkSize <= 0 || maxDownloadBytes <= 0
+        || maxDownloadBytes > MAX_DOWNLOAD_V2_BYTES) {
+        return {false, {}, "Invalid versioned download arguments."};
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        if (pendingDownloadOperationIdsV2.find(operationId)
+                != pendingDownloadOperationIdsV2.end()
+            || activeDownloadsV2.find(operationId) != activeDownloadsV2.end()
+            || terminalDownloadsV2.find(operationId) != terminalDownloadsV2.end()) {
+            return {false, {}, "Download operation ID is already in use."};
+        }
+        if (pendingDownloadCidsV2.find(cid) != pendingDownloadCidsV2.end()) {
+            return {false, {}, "A download for this CID is already starting."};
+        }
+        for (const auto& active : activeDownloadsV2) {
+            if (active.second.cid == cid) {
+                return {false, {}, "A download for this CID is already active."};
+            }
+        }
+        pendingDownloadOperationIdsV2.insert(operationId);
+        pendingDownloadCidsV2.insert(cid);
+    }
+
+    const auto manifest = syncCallString(storageCtx, storage_download_manifest, cid, 3000);
+    uint64_t manifestBytes = 0;
+    if (!manifest.ok || !manifestDatasetSize(manifest.message, manifestBytes)) {
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        pendingDownloadOperationIdsV2.erase(operationId);
+        pendingDownloadCidsV2.erase(cid);
+        return {false, {}, "Failed to read download manifest."};
+    }
+    if (manifestBytes > static_cast<uint64_t>(maxDownloadBytes)) {
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        pendingDownloadOperationIdsV2.erase(operationId);
+        pendingDownloadCidsV2.erase(cid);
+        return {false, {}, "Download exceeds requested byte limit."};
+    }
+
+    {
+        std::ofstream probe(filePath, std::ios::binary | std::ios::trunc);
+        if (!probe) {
+            std::lock_guard<std::mutex> lock(downloadV2Mutex);
+            pendingDownloadOperationIdsV2.erase(operationId);
+            pendingDownloadCidsV2.erase(cid);
+            return {false, {}, "Failed to open download destination."};
+        }
+    }
+
+    const auto initialized = syncCallDownloadInit(
+        storageCtx, storage_download_init, cid, static_cast<size_t>(chunkSize), local, 1000);
+    if (!initialized.ok) {
+        std::error_code ec;
+        fs::remove(filePath, ec);
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        pendingDownloadOperationIdsV2.erase(operationId);
+        pendingDownloadCidsV2.erase(cid);
+        return {false, {}, initialized.message};
+    }
+
+    auto state = std::make_shared<DownloadV2State>();
+    state->cid = cid;
+    state->operationId = operationId;
+    {
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        pendingDownloadOperationIdsV2.erase(operationId);
+        pendingDownloadCidsV2.erase(cid);
+        activeDownloadsV2.emplace(operationId, ActiveDownloadV2{cid, state});
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);
+        downloadV2Workers.reserve(downloadV2Workers.size() + 1);
+        std::thread worker(&StorageModuleImpl::runDownloadV2, this, state,
+                           filePath, chunkSize, manifestBytes,
+                           static_cast<uint64_t>(maxDownloadBytes));
+        downloadV2Workers.push_back({state, std::move(worker)});
+    } catch (const std::exception&) {
+        {
+            std::lock_guard<std::mutex> lock(downloadV2Mutex);
+            activeDownloadsV2.erase(operationId);
+        }
+        syncCallString(storageCtx, storage_download_cancel, cid, 1000);
+        std::error_code ec;
+        fs::remove(filePath, ec);
+        return {false, {}, "Failed to start versioned download worker."};
+    }
+
+    return {true,
+            json{
+                {"protocol", "logos.storage.download"},
+                {"version", DOWNLOAD_PROTOCOL_VERSION},
+                {"accepted", true},
+                {"moduleOperationId", operationId},
+                {"cid", cid},
+            },
+            ""};
+}
+
+StdLogosResult StorageModuleImpl::downloadCancelV2(const std::string& operationId) {
+    reapFinishedDownloadV2Workers();
+    if (operationId.empty()) {
+        return {false, {}, "Download operation ID is required."};
+    }
+
+    std::string cid;
+    std::shared_ptr<DownloadV2State> state;
+    {
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        const auto active = activeDownloadsV2.find(operationId);
+        if (active == activeDownloadsV2.end()) {
+            const auto terminal = terminalDownloadsV2.find(operationId);
+            if (terminal == terminalDownloadsV2.end()) {
+                return {true,
+                        json{
+                            {"protocol", "logos.storage.download"},
+                            {"version", DOWNLOAD_PROTOCOL_VERSION},
+                            {"moduleOperationId", operationId},
+                            {"cancelStatus", "not_found"},
+                        },
+                        ""};
+            }
+            return {true,
+                    json{
+                        {"protocol", "logos.storage.download"},
+                        {"version", DOWNLOAD_PROTOCOL_VERSION},
+                        {"moduleOperationId", operationId},
+                        {"cid", terminal->second.cid},
+                        {"cancelStatus", "already_terminal"},
+                        {"terminalOutcome", terminal->second.outcome},
+                    },
+                        ""};
+        }
+        cid = active->second.cid;
+        state = active->second.state;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->cancellationRequested = true;
+    }
+    if (!requestDownloadV2Cancellation(storageCtx, state)) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return {false, {}, state->cancellationError.empty()
+                ? "Failed to send download cancellation."
+                : state->cancellationError};
+    }
+
+    return {true,
+            json{
+                {"protocol", "logos.storage.download"},
+                {"version", DOWNLOAD_PROTOCOL_VERSION},
+                {"moduleOperationId", operationId},
+                {"cid", cid},
+                {"cancelStatus", "canceled"},
+            },
+            ""};
+}
+
+void StorageModuleImpl::runDownloadV2(
+    const std::shared_ptr<DownloadV2State>& state, const std::string& filePath,
+    int chunkSize, uint64_t expectedBytes, uint64_t maxBytes) {
+    std::ofstream output(filePath, std::ios::binary | std::ios::trunc);
+    auto removePartialFile = [&filePath] {
+        std::error_code ec;
+        fs::remove(filePath, ec);
+    };
+    auto cancellationRequested = [&state] {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return state->cancellationRequested;
+    };
+    auto finishCancellation = [&] {
+        requestDownloadV2Cancellation(storageCtx, state);
+        const SyncResult canceled = waitForDownloadV2Cancellation(state);
+        output.close();
+        removePartialFile();
+        if (canceled.ok) {
+            finishDownloadV2(state, "canceled");
+        } else {
+            finishDownloadV2(state, "failed", canceled.message);
+        }
+    };
+    auto fail = [&](const std::string& error, bool cancelSession) {
+        SyncResult cancellation{true, {}};
+        if (cancelSession) {
+            requestDownloadV2Cancellation(storageCtx, state);
+            cancellation = waitForDownloadV2Cancellation(state);
+        }
+        output.close();
+        removePartialFile();
+        if (cancellationRequested() && cancellation.ok) {
+            finishDownloadV2(state, "canceled");
+            return;
+        }
+        std::string failure = error.empty() ? "Storage download failed." : error;
+        if (!cancellation.ok) {
+            failure += " Cleanup failed: " + cancellation.message;
+        }
+        finishDownloadV2(state, "failed", failure);
+    };
+
+    if (!output) {
+        fail("Failed to open download destination.", true);
+        return;
+    }
+
+    uint64_t bytesWritten = 0;
+    while (true) {
+        if (cancellationRequested()) {
+            finishCancellation();
+            return;
+        }
+
+        const uint64_t remaining = bytesWritten <= maxBytes
+            ? maxBytes - bytesWritten
+            : 0;
+        const size_t maxChunkBytes = static_cast<size_t>(
+            std::min<uint64_t>(static_cast<uint64_t>(chunkSize), remaining));
+        const DownloadV2ChunkResult chunk = requestDownloadV2Chunk(
+            storageCtx, state->cid, maxChunkBytes);
+
+        if (cancellationRequested()) {
+            finishCancellation();
+            return;
+        }
+        if (!chunk.dispatched || !chunk.completed) {
+            fail(chunk.error.empty() ? "Failed to download chunk." : chunk.error, true);
+            return;
+        }
+        if (!chunk.succeeded) {
+            fail(chunk.error.empty() ? "Storage download chunk failed." : chunk.error, false);
+            return;
+        }
+        if (chunk.exceededLimit
+            || static_cast<uint64_t>(chunk.bytes.size()) > maxBytes - bytesWritten) {
+            fail("Download exceeded requested byte limit.", true);
+            return;
+        }
+        if (chunk.bytes.empty()) {
+            if (bytesWritten != expectedBytes) {
+                fail("Download size did not match its manifest.", true);
+                return;
+            }
+            output.flush();
+            if (!output) {
+                fail("Failed to write download destination.", true);
+                return;
+            }
+            output.close();
+            requestDownloadV2Cancellation(storageCtx, state);
+            const SyncResult cleanup = waitForDownloadV2Cancellation(state);
+            if (!cleanup.ok) {
+                removePartialFile();
+                finishDownloadV2(state, "failed", cleanup.message);
+                return;
+            }
+            if (cancellationRequested()) {
+                removePartialFile();
+                finishDownloadV2(state, "canceled");
+                return;
+            }
+            finishDownloadV2(state, "succeeded");
+            return;
+        }
+
+        output.write(reinterpret_cast<const char*>(chunk.bytes.data()),
+                     static_cast<std::streamsize>(chunk.bytes.size()));
+        if (!output) {
+            fail("Failed to write download destination.", true);
+            return;
+        }
+        bytesWritten += static_cast<uint64_t>(chunk.bytes.size());
+    }
+}
+
+void StorageModuleImpl::finishDownloadV2(
+    const std::shared_ptr<DownloadV2State>& state, const std::string& outcome,
+    const std::string& error) {
+    {
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        activeDownloadsV2.erase(state->operationId);
+        terminalDownloadsV2[state->operationId] = {state->cid, outcome};
+        terminalDownloadOrderV2.push_back(state->operationId);
+        while (terminalDownloadOrderV2.size() > MAX_TERMINAL_DOWNLOADS_V2) {
+            const std::string expired = terminalDownloadOrderV2.front();
+            terminalDownloadOrderV2.pop_front();
+            terminalDownloadsV2.erase(expired);
+        }
+    }
+
+    json payload = {
+        {"protocol", "logos.storage.download"},
+        {"version", DOWNLOAD_PROTOCOL_VERSION},
+        {"moduleOperationId", state->operationId},
+        {"cid", state->cid},
+        {"outcome", outcome},
+    };
+    if (outcome == "failed") {
+        payload["error"] = error.empty() ? "Storage download failed." : error;
+    }
+    emitJsonEvent(this, &StorageModuleImpl::storageDownloadDoneV2, payload,
+                  "StorageModuleImpl::finishDownloadV2");
+    state->workerFinished.store(true);
+}
+
+void StorageModuleImpl::reapFinishedDownloadV2Workers() {
+    std::vector<std::thread> finished;
+    {
+        std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);
+        auto worker = downloadV2Workers.begin();
+        while (worker != downloadV2Workers.end()) {
+            if (worker->state->workerFinished.load()) {
+                finished.push_back(std::move(worker->thread));
+                worker = downloadV2Workers.erase(worker);
+            } else {
+                ++worker;
+            }
+        }
+    }
+    for (std::thread& worker : finished) {
+        if (worker.joinable()) worker.join();
+    }
+}
+
+void StorageModuleImpl::cancelAndJoinDownloadV2Workers() {
+    std::vector<std::shared_ptr<DownloadV2State>> active;
+    {
+        std::lock_guard<std::mutex> lock(downloadV2Mutex);
+        for (const auto& entry : activeDownloadsV2) {
+            active.push_back(entry.second.state);
+        }
+    }
+    for (const auto& state : active) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->cancellationRequested = true;
+        }
+        requestDownloadV2Cancellation(storageCtx, state);
+    }
+
+    std::vector<DownloadV2Worker> workers;
+    {
+        std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);
+        workers.swap(downloadV2Workers);
+    }
+    for (DownloadV2Worker& worker : workers) {
+        if (worker.thread.joinable()) worker.thread.join();
+    }
 }
 
 // ---------------------------------------------------------------------------

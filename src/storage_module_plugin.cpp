@@ -205,6 +205,62 @@ static fs::path downloadV2StagingPath(const std::string& destinationPath) {
            + std::to_string(timestamp) + "-" + std::to_string(serial) + ".part");
 }
 
+static fs::path downloadV2BackupPath(const fs::path& destination) {
+    const auto timestamp = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const uint64_t serial = nextDownloadV2StagingFileId.fetch_add(1);
+    return destination.parent_path()
+        / (destination.filename().string() + ".storage-download-"
+           + std::to_string(timestamp) + "-" + std::to_string(serial) + ".backup");
+}
+
+// POSIX permits rename() to replace an existing file atomically, but Windows
+// does not. Try the direct path first, then use a backup-and-restore fallback
+// when an existing destination prevents replacement. On a failed fallback we
+// restore the original destination or retain its backup for recovery before
+// the caller removes the staging file.
+static bool replaceDownloadV2Destination(const fs::path& stagingPath,
+                                         const fs::path& destinationPath,
+                                         std::string& error) {
+    std::error_code renameError;
+    fs::rename(stagingPath, destinationPath, renameError);
+    if (!renameError) return true;
+
+    std::error_code existsError;
+    const bool destinationExists = fs::exists(destinationPath, existsError);
+    if (existsError || !destinationExists) {
+        error = "Failed to replace download destination: " + renameError.message();
+        return false;
+    }
+
+    const fs::path backupPath = downloadV2BackupPath(destinationPath);
+    std::error_code backupError;
+    fs::rename(destinationPath, backupPath, backupError);
+    if (backupError) {
+        error = "Failed to replace download destination: " + renameError.message();
+        return false;
+    }
+
+    std::error_code replacementError;
+    fs::rename(stagingPath, destinationPath, replacementError);
+    if (!replacementError) {
+        // Do not remove the original until the replacement is in place. If
+        // cleanup itself fails, retain the backup rather than risk data loss.
+        std::error_code cleanupError;
+        fs::remove(backupPath, cleanupError);
+        return true;
+    }
+
+    std::error_code restoreError;
+    fs::rename(backupPath, destinationPath, restoreError);
+    error = "Failed to replace download destination: " + replacementError.message();
+    if (restoreError) {
+        error += " Failed to restore original destination: " + restoreError.message()
+            + ". Original destination retained at " + backupPath.string() + ".";
+    }
+    return false;
+}
+
 enum class DownloadOwner {
     Legacy,
     Versioned,
@@ -1932,13 +1988,11 @@ void StorageModuleImpl::runDownloadV2(
                 finishDownloadV2(state, "canceled");
                 return;
             }
-            std::error_code renameError;
-            fs::rename(stagingPath, destinationPath, renameError);
-            if (renameError) {
+            std::string replacementError;
+            if (!replaceDownloadV2Destination(stagingPath, destinationPath,
+                                              replacementError)) {
                 removePartialFile();
-                finishDownloadV2(
-                    state, "failed",
-                    "Failed to replace download destination: " + renameError.message());
+                finishDownloadV2(state, "failed", replacementError);
                 return;
             }
             finishDownloadV2(state, "succeeded");

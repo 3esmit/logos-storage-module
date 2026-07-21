@@ -648,13 +648,15 @@ LOGOS_TEST(legacy_download_rejects_embedded_nuls_before_c_api_dispatch) {
     delete impl;
 }
 
-LOGOS_TEST(downloadToUrlV2_acknowledges_and_emits_correlated_terminal_event) {
+LOGOS_TEST(downloadToUrlV2_replaces_existing_destination_on_success) {
     auto t = LogosTestContext("storage_module");
     logos_test::EventCapture events;
     auto* impl = createInitializedImpl(t);
     t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
     constexpr char kPayload[] = "0123456789abcdef0123456789abcdef";
     const std::string path = "/tmp/logos-storage-v2-success";
+    // Windows requires the backup-and-replace fallback because its rename
+    // implementation cannot overwrite this existing destination directly.
     {
         std::ofstream existing(path, std::ios::binary | std::ios::trunc);
         existing << "existing backup";

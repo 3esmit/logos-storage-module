@@ -157,11 +157,16 @@ static constexpr int DOWNLOAD_PROTOCOL_VERSION = 2;
 static constexpr int DOWNLOAD_CANCEL_TIMEOUT_MS = 15000;
 static constexpr int DOWNLOAD_CHUNK_TIMEOUT_MS = 60000;
 static constexpr int MAX_DOWNLOAD_V2_BYTES = 1073741824;
+static constexpr int MAX_DOWNLOAD_V2_CHUNK_BYTES = 1048576;
 static constexpr size_t MAX_TERMINAL_DOWNLOADS_V2 = 128;
 static std::atomic<uint64_t> nextDownloadV2StagingFileId{0};
 
 static std::string fromMsg(const char* msg, size_t len) {
     return (msg && len > 0) ? std::string(msg, len) : std::string();
+}
+
+static bool containsEmbeddedNul(const std::string& value) {
+    return value.find('\0') != std::string::npos;
 }
 
 static bool manifestDatasetSize(const std::string& message, uint64_t& size) {
@@ -1104,6 +1109,7 @@ LogosMap StorageModuleImpl::downloadProtocol() {
         {"moduleOperationIdOwner", "caller"},
         {"cancelTimeoutMs", DOWNLOAD_CANCEL_TIMEOUT_MS},
         {"maxDownloadBytes", MAX_DOWNLOAD_V2_BYTES},
+        {"maxChunkBytes", MAX_DOWNLOAD_V2_CHUNK_BYTES},
     };
 }
 
@@ -1115,9 +1121,13 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
         return {false, {}, "Storage context not initialized."};
     }
     if (cid.empty() || filePath.empty() || operationId.empty()
+        || containsEmbeddedNul(cid) || containsEmbeddedNul(filePath)
+        || containsEmbeddedNul(operationId)
         || operationId.find_first_of(" \t\r\n") != std::string::npos || operationId == cid
         || chunkSize <= 0 || maxDownloadBytes <= 0
-        || maxDownloadBytes > MAX_DOWNLOAD_V2_BYTES) {
+        || maxDownloadBytes > MAX_DOWNLOAD_V2_BYTES
+        || chunkSize > MAX_DOWNLOAD_V2_CHUNK_BYTES
+        || chunkSize > maxDownloadBytes) {
         return {false, {}, "Invalid versioned download arguments."};
     }
 

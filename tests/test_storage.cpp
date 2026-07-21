@@ -568,6 +568,45 @@ LOGOS_TEST(downloadProtocol_reports_v2_contract) {
                     std::string("caller"));
     LOGOS_ASSERT_EQ(protocol.at("cancelTimeoutMs").get<int>(), 15000);
     LOGOS_ASSERT_EQ(protocol.at("maxDownloadBytes").get<int>(), 1073741824);
+    LOGOS_ASSERT_EQ(protocol.at("maxChunkBytes").get<int>(), 1048576);
+}
+
+LOGOS_TEST(downloadToUrlV2_rejects_unsafe_chunk_size_before_init) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+
+    const StdLogosResult result = impl->downloadToUrlV2(
+        "QmTooLargeChunk", "/tmp/versioned-download", false, 65,
+        "download-operation-too-large-chunk", 64);
+
+    LOGOS_ASSERT_FALSE(result.success);
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_manifest"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_init"));
+
+    impl->destroy();
+    delete impl;
+}
+
+LOGOS_TEST(downloadToUrlV2_rejects_embedded_nuls_before_c_api_dispatch) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+
+    const std::string cidWithNul{"QmVersionedCid\0other", 20};
+    const std::string pathWithNul{"/tmp/versioned\0other", 20};
+    const StdLogosResult cidResult = impl->downloadToUrlV2(
+        cidWithNul, "/tmp/versioned-download", false, 64,
+        "download-operation-nul-cid", 64);
+    const StdLogosResult pathResult = impl->downloadToUrlV2(
+        "QmVersionedCid", pathWithNul, false, 64,
+        "download-operation-nul-path", 64);
+
+    LOGOS_ASSERT_FALSE(cidResult.success);
+    LOGOS_ASSERT_FALSE(pathResult.success);
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_manifest"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_init"));
+
+    impl->destroy();
+    delete impl;
 }
 
 LOGOS_TEST(downloadToUrlV2_acknowledges_and_emits_correlated_terminal_event) {

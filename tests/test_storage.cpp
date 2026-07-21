@@ -790,9 +790,15 @@ LOGOS_TEST(downloadToUrlV2_cancels_after_delayed_initialization) {
     LOGOS_ASSERT_EQ(blocked.error,
                     std::string("A download for this CID is already starting."));
 
-    mockStorageResetDownloadCancelObservation();
+    // Hold the cleanup cancellation so this test can establish that the late
+    // init opened a native session before explicitly confirming its teardown.
+    // Waiting only for dispatch is racy: the mock reports dispatch before it
+    // clears the held session.
+    mockStorageHoldNextDownloadCancel();
     mockStorageCompleteHeldDownloadInit(RET_OK, nullptr);
-    LOGOS_ASSERT(mockStorageWaitForDownloadCancel(1000));
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadCancel(1000));
+    LOGOS_ASSERT(mockStorageHeldDownloadInitSessionOpen());
+    mockStorageCompleteHeldDownloadCancel(RET_OK, nullptr);
     LOGOS_ASSERT_FALSE(mockStorageHeldDownloadInitSessionOpen());
 
     mockStorageSetNextDownloadChunkPayload("0123456789abcdef0123456789abcdef");

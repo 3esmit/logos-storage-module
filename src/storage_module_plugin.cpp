@@ -258,6 +258,11 @@ struct TerminalDownloadV2 {
     std::string outcome;
 };
 
+struct DownloadLeaseCleanupWorker {
+    std::shared_ptr<std::atomic<bool>> finished;
+    std::thread thread;
+};
+
 struct DownloadRegistry {
     std::mutex mutex;
     bool closing = false;
@@ -266,7 +271,7 @@ struct DownloadRegistry {
     std::unordered_map<std::string, std::shared_ptr<DownloadV2State>> activeDownloadsV2;
     std::unordered_map<std::string, TerminalDownloadV2> terminalDownloadsV2;
     std::deque<std::string> terminalDownloadOrderV2;
-    std::vector<std::thread> cleanupWorkers;
+    std::vector<DownloadLeaseCleanupWorker> cleanupWorkers;
 };
 
 static std::shared_ptr<DownloadLease> reserveDownloadLease(
@@ -337,6 +342,26 @@ static bool isDownloadRegistryClosing(const std::shared_ptr<DownloadRegistry>& r
 static void closeDownloadRegistry(const std::shared_ptr<DownloadRegistry>& registry) {
     std::lock_guard<std::mutex> lock(registry->mutex);
     registry->closing = true;
+}
+
+static void reapFinishedDownloadLeaseCleanupWorkers(
+    const std::shared_ptr<DownloadRegistry>& registry) {
+    std::vector<std::thread> finished;
+    {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        auto worker = registry->cleanupWorkers.begin();
+        while (worker != registry->cleanupWorkers.end()) {
+            if (worker->finished->load(std::memory_order_acquire)) {
+                finished.push_back(std::move(worker->thread));
+                worker = registry->cleanupWorkers.erase(worker);
+            } else {
+                ++worker;
+            }
+        }
+    }
+    for (std::thread& worker : finished) {
+        if (worker.joinable()) worker.join();
+    }
 }
 
 static bool activateDownloadV2(const std::shared_ptr<DownloadV2State>& state) {
@@ -999,6 +1024,7 @@ static void enqueueDownloadLeaseCleanup(
     const std::shared_ptr<DownloadLease>& lease) {
     if (!registry || !lease) return;
 
+    reapFinishedDownloadLeaseCleanupWorkers(registry);
     bool releaseWithoutCancel = false;
     try {
         std::lock_guard<std::mutex> lock(registry->mutex);
@@ -1009,21 +1035,26 @@ static void enqueueDownloadLeaseCleanup(
             if (current != registry->leasesByCid.end() && current->second == lease) {
                 lease->phase = DownloadPhase::Cleaning;
             }
-            registry->cleanupWorkers.emplace_back([storageCtx, registry, lease] {
-                if (isDownloadRegistryClosing(registry)) {
-                    releaseDownloadLease(registry, lease);
-                    return;
-                }
-                try {
-                    auto* ctx = new DownloadLeaseCleanupCtx{registry, lease};
-                    // The libstorage callback owns ctx for both success and
-                    // immediate dispatch failure. Do not block its worker.
-                    (void)storage_download_cancel(storageCtx, lease->cid.c_str(),
-                                                  downloadLeaseCleanupCallback, ctx);
-                } catch (const std::exception&) {
-                    setDownloadLeasePhase(registry, lease, DownloadPhase::Cleaning);
-                }
-            });
+            const auto workerFinished = std::make_shared<std::atomic<bool>>(false);
+            registry->cleanupWorkers.reserve(registry->cleanupWorkers.size() + 1);
+            registry->cleanupWorkers.push_back(
+                {workerFinished, std::thread([storageCtx, registry, lease, workerFinished] {
+                    if (isDownloadRegistryClosing(registry)) {
+                        releaseDownloadLease(registry, lease);
+                    } else {
+                        try {
+                            auto* ctx = new DownloadLeaseCleanupCtx{registry, lease};
+                            // The libstorage callback owns ctx for both success and
+                            // immediate dispatch failure. Do not block its worker.
+                            (void)storage_download_cancel(
+                                storageCtx, lease->cid.c_str(),
+                                downloadLeaseCleanupCallback, ctx);
+                        } catch (const std::exception&) {
+                            setDownloadLeasePhase(registry, lease, DownloadPhase::Cleaning);
+                        }
+                    }
+                    workerFinished->store(true, std::memory_order_release);
+                })});
         }
     } catch (const std::exception&) {
         setDownloadLeasePhase(registry, lease, DownloadPhase::Cleaning);
@@ -1033,13 +1064,13 @@ static void enqueueDownloadLeaseCleanup(
 
 static void joinDownloadLeaseCleanupWorkers(
     const std::shared_ptr<DownloadRegistry>& registry) {
-    std::vector<std::thread> workers;
+    std::vector<DownloadLeaseCleanupWorker> workers;
     {
         std::lock_guard<std::mutex> lock(registry->mutex);
         workers.swap(registry->cleanupWorkers);
     }
-    for (std::thread& worker : workers) {
-        if (worker.joinable()) worker.join();
+    for (DownloadLeaseCleanupWorker& worker : workers) {
+        if (worker.thread.joinable()) worker.thread.join();
     }
 }
 
@@ -1418,6 +1449,7 @@ std::string StorageModuleImpl::downloadChunksInternal(const std::string& cid,
                                                        const std::string& filepath,
                                                        bool local,
                                                        int64_t chunkSize) {
+    reapFinishedDownloadLeaseCleanupWorkers(downloadRegistry);
     if (!storageCtx || chunkSize <= 0 || chunkSize > MAX_DOWNLOAD_V2_CHUNK_BYTES
         || cid.empty() || containsEmbeddedNul(cid)
         || containsEmbeddedNul(filepath)) {
@@ -1500,6 +1532,7 @@ StdLogosResult StorageModuleImpl::downloadChunks(const std::string& cid, bool lo
 }
 
 StdLogosResult StorageModuleImpl::downloadCancel(const std::string& sessionId) {
+    reapFinishedDownloadLeaseCleanupWorkers(downloadRegistry);
     if (!storageCtx) return {false, {}, "Storage context not initialized."};
     if (sessionId.empty() || containsEmbeddedNul(sessionId)) {
         return {false, {}, "Invalid download session ID."};
@@ -1975,6 +2008,7 @@ void StorageModuleImpl::finishDownloadV2(
 }
 
 void StorageModuleImpl::reapFinishedDownloadV2Workers() {
+    reapFinishedDownloadLeaseCleanupWorkers(downloadRegistry);
     std::vector<std::thread> finished;
     {
         std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);

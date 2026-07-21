@@ -1070,6 +1070,39 @@ LOGOS_TEST(downloadToUrlV2_reports_terminal_failure_after_chunk_dispatch_failure
     fs::remove(path);
 }
 
+LOGOS_TEST(downloadToUrlV2_cancels_session_after_terminal_chunk_failure) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    const std::string path = "/tmp/logos-storage-v2-terminal-chunk-failure";
+    fs::remove(path);
+    mockStorageHoldNextDownloadChunk();
+
+    const StdLogosResult start = impl->downloadToUrlV2(
+        "QmTerminalChunkFailure", path, false, 65536,
+        "download-operation-terminal-chunk-failure", 64);
+    LOGOS_ASSERT_TRUE(start.success);
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadChunk(1000));
+
+    mockStorageHoldNextDownloadCancel();
+    mockStorageCompleteHeldDownloadChunk(RET_ERR, nullptr, "forced terminal chunk failure");
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadCancel(1000));
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_download_cancel"), 1);
+
+    mockStorageCompleteHeldDownloadCancel(RET_OK, nullptr);
+    const auto event = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(event.name, std::string("storageDownloadDoneV2"));
+    const json terminal = json::parse(event.data);
+    LOGOS_ASSERT_EQ(terminal.at("outcome").get<std::string>(), std::string("failed"));
+    LOGOS_ASSERT_EQ(terminal.at("error").get<std::string>(),
+                    std::string("forced terminal chunk failure"));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
+}
+
 LOGOS_TEST(downloadToUrlV2_preserves_existing_destination_after_failure) {
     auto t = LogosTestContext("storage_module");
     logos_test::EventCapture events;

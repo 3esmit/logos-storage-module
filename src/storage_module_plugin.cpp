@@ -1866,7 +1866,7 @@ void StorageModuleImpl::runDownloadV2(
             return;
         }
         if (!chunk.succeeded) {
-            fail(chunk.error.empty() ? "Storage download chunk failed." : chunk.error, false);
+            fail(chunk.error.empty() ? "Storage download chunk failed." : chunk.error, true);
             return;
         }
         if (chunk.exceededLimit

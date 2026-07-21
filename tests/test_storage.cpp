@@ -587,7 +587,7 @@ LOGOS_TEST(downloadProtocol_reports_v2_contract) {
     LOGOS_ASSERT_EQ(protocol.at("maxChunkBytes").get<int>(), 1048576);
 }
 
-LOGOS_TEST(downloadToUrlV2_rejects_unsafe_chunk_size_before_init) {
+LOGOS_TEST(downloadToUrlV2_rejects_unsafe_chunk_size_before_c_api_dispatch) {
     auto t = LogosTestContext("storage_module");
     auto* impl = createInitializedImpl(t);
 

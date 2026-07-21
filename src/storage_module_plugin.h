@@ -329,12 +329,13 @@ public:
 
     /// Start a caller-correlated file download.
     ///
-    /// `operationId` must be a unique, non-empty caller-generated value and
-    /// must not equal `cid`. `maxDownloadBytes` must be positive and no larger
-    /// than the limit advertised by downloadProtocol(). `chunkSize` must be
-    /// positive and no larger than `maxChunkBytes`; it is capped to
-    /// `maxDownloadBytes` before native initialization. The manifest is checked
-    /// before the download starts; oversized content is rejected before dispatch.
+    /// `operationId` must be a unique, non-empty caller-generated value, must
+    /// not equal `cid`, and must not contain a space, tab, carriage return, or
+    /// newline. `maxDownloadBytes` must be positive and no larger than the
+    /// limit advertised by downloadProtocol(). `chunkSize` must be positive and
+    /// no larger than `maxChunkBytes`; it is capped to `maxDownloadBytes` before
+    /// native initialization. The manifest is checked before the download
+    /// starts; oversized content is rejected before dispatch.
     /// Content is written to a sibling staging file and replaces `filePath` only
     /// after a successful terminal result. Failed or canceled downloads preserve
     /// a pre-existing destination file.
@@ -362,8 +363,10 @@ public:
     ///
     /// The response identifies the operation and one of `canceled`,
     /// `already_terminal`, or `not_found`. An `already_terminal` response also
-    /// includes its `terminalOutcome`. Invalid arguments and cancellation
-    /// dispatch failures return an unsuccessful StdLogosResult instead of a
+    /// includes its `terminalOutcome`. A `canceled` response acknowledges the
+    /// cancellation request; storageDownloadDoneV2() remains authoritative for
+    /// the terminal outcome. Invalid arguments and cancellation dispatch
+    /// failures return an unsuccessful StdLogosResult instead of a
     /// cancellation-status map.
     StdLogosResult downloadCancelV2(const std::string& operationId);
 

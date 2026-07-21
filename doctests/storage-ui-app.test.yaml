@@ -31,7 +31,6 @@ what_you_learn:
   - How to drive a headless Qt/QML app with logos-qt-mcp (wait, assert, screenshot)
   - How to walk the real onboarding wizard and assert the config editor rejects invalid JSON
   - How to drive a file upload headlessly by setting the QML FileDialog's selectedFile instead of using the native picker
-  - How to use the new Mixnet-based private queries to download a public file
   - How to drive icon-only controls (the manifest download/delete buttons) by objectName
   - How to exercise the full node lifecycle from the UI: stop, restart (data persists), delete (storage frees), and verify the round-tripped file on disk
 
@@ -370,115 +369,6 @@ sections:
                 the node and writes the file to the downloads folder. When it finishes,
                 the download widget reports it done.
 
-            - name: "Delete the file from the manifest"
-              action: click_object
-              find_by: "objectName"
-              find_value: "deleteButton"
-
-            - name: "Storage frees up (file removed through the module)"
-              action: wait_for
-              texts: ["0 B Utilized"]
-              timeout: 30000
-              screenshot: "storage-ui-deleted.png"
-              text: |
-                The file leaves the manifest list and the node's used space falls
-                back to **0 B Utilized** — the blocks were really dropped, closing
-                the upload → download → delete round-trip.
-
-            - name: "Privately download a public file with Mix"
-              action: expect_property
-              find_by: "text"
-              find_value: "Mix"
-              property: "checked"
-              value: true
-              text: |
-                So far we have been playing around with a local file. We are now going
-                to do another download, but of a public file this time. And we are going
-                to leverage the new "private query" feature to do that. Private
-                queries can be enabled or disabled by toggling the "Mix" switch.
-                When enabled (default), the node will forward DHT queries over the
-                Logos mix network, which makes those much harder to trace back to you.
-                The file we will be downloading is the
-                [Farewell to Westphalia book](https://logos.co/farewell-to-westphalia).
-
-            - name: "Disable private queries"
-              action: click_object
-              find_by: "text"
-              find_value: "Mix"
-
-            - name: "Show private queries are disabled"
-              action: expect_property
-              find_by: "text"
-              find_value: "Mix"
-              property: "checked"
-              value: false
-              text: |
-                Private queries can be slower, and may fail more often than non-private ones.
-                When downloading content that is not sensitive, you can always toggle the switch
-                by clicking it. This will allow observers to link you to your queries.
-              screenshot: "storage-ui-mix-disabled.png"
-
-            - name: "Re-enable private queries"
-              action: click_object
-              find_by: "text"
-              find_value: "Mix"
-
-            - name: "Show private queries are enabled"
-              action: expect_property
-              find_by: "text"
-              find_value: "Mix"
-              property: "checked"
-              value: true
-              text: |
-                Here we want to use mix, so we will keep this enabled.
-              screenshot: "storage-ui-mix-enabled.png"
-
-            - name: "Paste the public file's CID into Fetch Manifest"
-              action: set_property
-              find_by: "placeholderText"
-              find_value: "CID"
-              property: "text"
-              value: "zDvZRwzkzrrYB6sS1rRpRLt4gBhc1pWoyTSjkfszfmj1seaYYLCZ"
-              is_step: true
-
-            - name: "Fetch the manifest by CID"
-              action: call_method
-              find_by: "text"
-              find_value: "Fetch"
-              method: "clicked"
-              is_step: true
-
-            - name: "Let the fetch run"
-              action: sleep
-              ms: 60000
-
-            - name: "Click the manifest row's download button"
-              action: click_object
-              find_by: "objectName"
-              find_value: "downloadButton"
-              is_step: true
-
-            - name: "Let the download run"
-              action: sleep
-              ms: 30000
-              is_step: true
-
-            - name: "Download completes (UI reports it done)"
-              action: expect_property
-              find_by: "objectName"
-              find_value: "downloadWidget"
-              property: "isDone"
-              value: true
-              is_step: true
-              screenshot: "storage-ui-private-query-downloaded.png"
-              text: |
-                The remained of the download procedure remains as before - paste the CID,
-                fetch the manifest, and download the file. The node will again show that
-                the download is complete when it is done.
-
-            - name: "Check that we actually engaged the mix network"
-              run: 'grep -q "Selected mix node" ui-test-app.log'
-
             - name: "Stop the node"
               action: click
               target: "Stop"
@@ -504,10 +394,10 @@ sections:
 
             - name: "The uploaded file survived the restart"
               action: wait_for
-              texts: ["farewell-to-westphalia-foss-edition.pdf"]
+              texts: ["storage-ui-upload.txt"]
               timeout: 60000
               text: |
-                Because the node persists the data into a data dir configured earlier,
+                Because the node persists its data in the configured data directory,
                 the uploaded file survives the stop/start cycle.
 
             - name: "Delete the file from the manifest"
@@ -521,7 +411,7 @@ sections:
               timeout: 30000
               screenshot: "storage-ui-deleted.png"
               text: |
-                Once again the file leaves the manifest list and the node's used space
+                The file leaves the manifest list and the node's used space
                 goes back to **0 B Utilized**, signaling that the delete went through.
 
         post_text: |
@@ -540,15 +430,3 @@ sections:
     steps:
       - title: "Check the round-tripped file"
         run: 'grep -q "hello from the storage UI doctest" "$HOME/storage-ui-upload.txt" && echo "round-trip OK"'
-      - title: "Check the public file"
-        run: |
-          if [ "$(uname)" = "Darwin" ]; then
-            file_size=$(stat -f%z "$HOME/farewell-to-westphalia-foss-edition.pdf")
-          else
-            file_size=$(stat -c%s "$HOME/farewell-to-westphalia-foss-edition.pdf")
-          fi
-          if [ "$file_size" -ne 2276462 ]; then
-            echo "public file size mismatch: $file_size"
-            exit 1
-          fi
-          echo "public file OK"

@@ -702,6 +702,33 @@ LOGOS_TEST(downloadToUrlV2_replaces_existing_destination_on_success) {
     fs::remove(path);
 }
 
+LOGOS_TEST(downloadToUrlV2_preserves_existing_directory_destination) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    constexpr char kPayload[] = "0123456789abcdef0123456789abcdef";
+    const fs::path path = "/tmp/logos-storage-v2-directory-destination";
+    std::error_code cleanupError;
+    fs::remove(path, cleanupError);
+    LOGOS_ASSERT_TRUE(fs::create_directory(path));
+    mockStorageSetNextDownloadChunkPayload(kPayload);
+
+    const StdLogosResult result = impl->downloadToUrlV2(
+        "QmDirectoryDestination", path.string(), false, 65536,
+        "download-operation-directory-destination", 64);
+    LOGOS_ASSERT_TRUE(result.success);
+    const auto event = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(event.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(event.data).at("outcome").get<std::string>(),
+                    std::string("failed"));
+    LOGOS_ASSERT_TRUE(fs::is_directory(path));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path, cleanupError);
+}
+
 LOGOS_TEST(downloadToUrlV2_rejects_oversized_manifest_before_chunk_dispatch) {
     auto t = LogosTestContext("storage_module");
     auto* impl = createInitializedImpl(t);

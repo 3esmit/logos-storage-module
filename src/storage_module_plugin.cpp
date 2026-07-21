@@ -222,14 +222,43 @@ static fs::path downloadV2BackupPath(const fs::path& destination) {
 static bool replaceDownloadV2Destination(const fs::path& stagingPath,
                                          const fs::path& destinationPath,
                                          std::string& error) {
+    std::error_code destinationStatusError;
+    const bool destinationExists = fs::exists(destinationPath, destinationStatusError);
+    if (destinationStatusError) {
+        error = "Failed to inspect download destination: "
+            + destinationStatusError.message();
+        return false;
+    }
+    if (destinationExists) {
+        std::error_code destinationTypeError;
+        const bool destinationIsRegular =
+            fs::is_regular_file(destinationPath, destinationTypeError);
+        if (destinationTypeError || !destinationIsRegular) {
+            error = destinationTypeError
+                ? "Failed to inspect download destination: " + destinationTypeError.message()
+                : "Failed to replace download destination: destination is not a regular file.";
+            return false;
+        }
+    }
+
     std::error_code renameError;
     fs::rename(stagingPath, destinationPath, renameError);
     if (!renameError) return true;
 
     std::error_code existsError;
-    const bool destinationExists = fs::exists(destinationPath, existsError);
-    if (existsError || !destinationExists) {
+    const bool destinationStillExists = fs::exists(destinationPath, existsError);
+    if (existsError || !destinationStillExists) {
         error = "Failed to replace download destination: " + renameError.message();
+        return false;
+    }
+
+    std::error_code destinationTypeError;
+    const bool destinationIsRegular =
+        fs::is_regular_file(destinationPath, destinationTypeError);
+    if (destinationTypeError || !destinationIsRegular) {
+        error = destinationTypeError
+            ? "Failed to inspect download destination: " + destinationTypeError.message()
+            : "Failed to replace download destination: destination is not a regular file.";
         return false;
     }
 

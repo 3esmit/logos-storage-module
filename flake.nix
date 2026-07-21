@@ -42,7 +42,7 @@
             ran=0
             for bin in ${unitTests}/bin/*; do
               name="$(basename "$bin")"
-              if [ -n "$filter" ] && ! echo "$name" | grep -q "$filter"; then
+              if [ -n "$filter" ] && ! printf '%s\n' "$name" | ${pkgs.gnugrep}/bin/grep -q -- "$filter"; then
                 continue
               fi
               echo "=== $name ==="

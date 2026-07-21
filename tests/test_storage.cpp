@@ -7,10 +7,13 @@
 #include "storage_module_plugin.h"
 #include "mocks/mock_libstorage_control.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <nlohmann/json.hpp>
+#include <thread>
+#include <vector>
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -20,6 +23,19 @@ static StorageModuleImpl* createInitializedImpl(LogosTestContext& t) {
     auto* impl = new StorageModuleImpl();
     LOGOS_ASSERT_TRUE(impl->init("{\"data-dir\":\"/tmp/test\"}"));
     return impl;
+}
+
+static std::vector<logos_test::EventCapture::Entry> waitForEventCount(
+    logos_test::EventCapture& events, const std::string& name, size_t count,
+    int timeoutMs) {
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto entries = events.all(name);
+        if (entries.size() >= count) return entries;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return events.all(name);
 }
 
 // init
@@ -575,11 +591,11 @@ LOGOS_TEST(downloadToUrlV2_rejects_unsafe_chunk_size_before_init) {
     auto t = LogosTestContext("storage_module");
     auto* impl = createInitializedImpl(t);
 
-    const StdLogosResult result = impl->downloadToUrlV2(
-        "QmTooLargeChunk", "/tmp/versioned-download", false, 65,
-        "download-operation-too-large-chunk", 64);
+    const StdLogosResult absoluteLimit = impl->downloadToUrlV2(
+        "QmAbsoluteChunk", "/tmp/versioned-download", false, 1048577,
+        "download-operation-absolute-chunk", 1073741824);
 
-    LOGOS_ASSERT_FALSE(result.success);
+    LOGOS_ASSERT_FALSE(absoluteLimit.success);
     LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_manifest"));
     LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_init"));
 
@@ -604,6 +620,29 @@ LOGOS_TEST(downloadToUrlV2_rejects_embedded_nuls_before_c_api_dispatch) {
     LOGOS_ASSERT_FALSE(pathResult.success);
     LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_manifest"));
     LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_init"));
+
+    impl->destroy();
+    delete impl;
+}
+
+LOGOS_TEST(legacy_download_rejects_embedded_nuls_before_c_api_dispatch) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+
+    const std::string cidWithNul{"QmLegacyCid\0other", 17};
+    const std::string pathWithNul{"/tmp/legacy\0other", 17};
+    const StdLogosResult cidResult = impl->downloadChunks(cidWithNul, false, 64);
+    const StdLogosResult pathResult = impl->downloadToUrl(
+        "QmLegacyCid", pathWithNul, false, 64);
+    const StdLogosResult cancelResult = impl->downloadCancel(cidWithNul);
+
+    LOGOS_ASSERT_FALSE(cidResult.success);
+    LOGOS_ASSERT_FALSE(pathResult.success);
+    LOGOS_ASSERT_FALSE(cancelResult.success);
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_manifest"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_init"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_stream"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_cancel"));
 
     impl->destroy();
     delete impl;
@@ -718,6 +757,172 @@ LOGOS_TEST(downloadToUrlV2_cancel_reports_canceled_terminal_outcome) {
     fs::remove(path);
 }
 
+LOGOS_TEST(downloadToUrlV2_cancels_after_delayed_initialization) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    const std::string path = "/tmp/logos-storage-v2-delayed-init";
+    fs::remove(path);
+    mockStorageHoldNextDownloadInit();
+
+    const StdLogosResult start = impl->downloadToUrlV2(
+        "QmDelayedInitCid", path, false, 65536,
+        "download-operation-delayed-init", 64);
+    LOGOS_ASSERT_TRUE(start.success);
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadInit(1000));
+
+    const StdLogosResult cancel = impl->downloadCancelV2("download-operation-delayed-init");
+    LOGOS_ASSERT_TRUE(cancel.success);
+    LOGOS_ASSERT_EQ(cancel.value.at("cancelStatus").get<std::string>(),
+                    std::string("canceled"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_cancel"));
+
+    const auto canceledEvent = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(canceledEvent.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(canceledEvent.data).at("outcome").get<std::string>(),
+                    std::string("canceled"));
+
+    const StdLogosResult blocked = impl->downloadToUrlV2(
+        "QmDelayedInitCid", path, false, 65536,
+        "download-operation-delayed-init-retry", 64);
+    LOGOS_ASSERT_FALSE(blocked.success);
+    LOGOS_ASSERT_EQ(blocked.error,
+                    std::string("A download for this CID is already starting."));
+
+    mockStorageResetDownloadCancelObservation();
+    mockStorageCompleteHeldDownloadInit(RET_OK, nullptr);
+    LOGOS_ASSERT(mockStorageWaitForDownloadCancel(1000));
+    LOGOS_ASSERT_FALSE(mockStorageHeldDownloadInitSessionOpen());
+
+    mockStorageSetNextDownloadChunkPayload("0123456789abcdef0123456789abcdef");
+    const StdLogosResult retry = impl->downloadToUrlV2(
+        "QmDelayedInitCid", path, false, 65536,
+        "download-operation-delayed-init-retry", 64);
+    LOGOS_ASSERT_TRUE(retry.success);
+    const auto retryEvents = waitForEventCount(events, "storageDownloadDoneV2", 2, 1000);
+    LOGOS_ASSERT_EQ(retryEvents.size(), static_cast<size_t>(2));
+    LOGOS_ASSERT_EQ(json::parse(retryEvents.at(1).data).at("outcome").get<std::string>(),
+                    std::string("succeeded"));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
+}
+
+LOGOS_TEST(downloadToUrlV2_releases_routing_after_rejected_initialization) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    t.mockCFunction("storage_download_init").returns(RET_ERR);
+    const std::string path = "/tmp/logos-storage-v2-rejected-init";
+    fs::remove(path);
+
+    const StdLogosResult rejected = impl->downloadToUrlV2(
+        "QmRejectedInitCid", path, false, 65536,
+        "download-operation-rejected-init", 64);
+    LOGOS_ASSERT_FALSE(rejected.success);
+
+    t.mockCFunction("storage_download_init").returns(RET_OK);
+    mockStorageSetNextDownloadChunkPayload("0123456789abcdef0123456789abcdef");
+    const StdLogosResult retry = impl->downloadToUrlV2(
+        "QmRejectedInitCid", path, false, 65536,
+        "download-operation-rejected-init-retry", 64);
+    LOGOS_ASSERT_TRUE(retry.success);
+    const auto event = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(event.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(event.data).at("outcome").get<std::string>(),
+                    std::string("succeeded"));
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_download_init"), 2);
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
+}
+
+LOGOS_TEST(downloadToUrlV2_handles_immediate_cancel_dispatch_failure) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    const std::string path = "/tmp/logos-storage-v2-cancel-dispatch-failure";
+    fs::remove(path);
+    mockStorageHoldNextDownloadChunk();
+
+    const StdLogosResult start = impl->downloadToUrlV2(
+        "QmCancelDispatchFailure", path, false, 65536,
+        "download-operation-cancel-dispatch-failure", 64);
+    LOGOS_ASSERT_TRUE(start.success);
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadChunk(1000));
+
+    t.mockCFunction("storage_download_cancel").returns(RET_ERR);
+    const StdLogosResult cancel = impl->downloadCancelV2(
+        "download-operation-cancel-dispatch-failure");
+    LOGOS_ASSERT_FALSE(cancel.success);
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_download_cancel"), 1);
+
+    mockStorageCompleteHeldDownloadChunk(RET_OK, nullptr, nullptr);
+    const auto event = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(event.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(event.data).at("outcome").get<std::string>(),
+                    std::string("failed"));
+
+    const StdLogosResult retry = impl->downloadToUrlV2(
+        "QmCancelDispatchFailure", path, false, 65536,
+        "download-operation-cancel-dispatch-failure-retry", 64);
+    LOGOS_ASSERT_FALSE(retry.success);
+    LOGOS_ASSERT_EQ(retry.error,
+                    std::string("A download for this CID is already active."));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
+}
+
+LOGOS_TEST(downloadToUrlV2_releases_lease_after_late_cancel_confirmation) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    const std::string path = "/tmp/logos-storage-v2-late-cancel";
+    fs::remove(path);
+    mockStorageHoldNextDownloadChunk();
+    mockStorageHoldNextDownloadCancel();
+
+    const StdLogosResult start = impl->downloadToUrlV2(
+        "QmLateCancelCid", path, false, 65536,
+        "download-operation-late-cancel", 64);
+    LOGOS_ASSERT_TRUE(start.success);
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadChunk(1000));
+
+    const StdLogosResult cancel = impl->downloadCancelV2(
+        "download-operation-late-cancel");
+    LOGOS_ASSERT_TRUE(cancel.success);
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadCancel(1000));
+
+    mockStorageCompleteHeldDownloadChunk(RET_OK, nullptr, nullptr);
+    const auto failedEvent = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(failedEvent.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(failedEvent.data).at("outcome").get<std::string>(),
+                    std::string("failed"));
+
+    mockStorageCompleteHeldDownloadCancel(RET_OK, nullptr);
+    mockStorageSetNextDownloadChunkPayload("0123456789abcdef0123456789abcdef");
+    const StdLogosResult retry = impl->downloadToUrlV2(
+        "QmLateCancelCid", path, false, 65536,
+        "download-operation-late-cancel-retry", 64);
+    LOGOS_ASSERT_TRUE(retry.success);
+    const auto retryEvents = waitForEventCount(events, "storageDownloadDoneV2", 2, 1000);
+    LOGOS_ASSERT_EQ(retryEvents.size(), static_cast<size_t>(2));
+    LOGOS_ASSERT_EQ(json::parse(retryEvents.at(1).data).at("outcome").get<std::string>(),
+                    std::string("succeeded"));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
+}
+
 LOGOS_TEST(downloadToUrlV2_rejects_a_second_active_session_for_the_same_cid) {
     auto t = LogosTestContext("storage_module");
     logos_test::EventCapture events;
@@ -748,6 +953,86 @@ LOGOS_TEST(downloadToUrlV2_rejects_a_second_active_session_for_the_same_cid) {
     delete impl;
     fs::remove(firstPath);
     fs::remove(secondPath);
+}
+
+LOGOS_TEST(legacy_download_blocks_versioned_download_for_the_same_cid) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    constexpr char kPayload[] = "0123456789abcdef0123456789abcdef";
+    const std::string path = "/tmp/logos-storage-v2-after-legacy";
+    fs::remove(path);
+    mockStorageHoldNextDownloadStream();
+
+    const StdLogosResult legacy = impl->downloadChunks("QmLegacyFirstCid", false, 64);
+    LOGOS_ASSERT_TRUE(legacy.success);
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadStream(1000));
+    const int initCalls = t.cFunctionCallCount("storage_download_init");
+
+    const StdLogosResult versioned = impl->downloadToUrlV2(
+        "QmLegacyFirstCid", path, false, 64,
+        "download-operation-after-legacy", 64);
+    LOGOS_ASSERT_FALSE(versioned.success);
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_download_init"), initCalls);
+
+    mockStorageCompleteHeldDownloadStream(RET_OK, nullptr);
+    const auto legacyDone = events.waitFor("storageDownloadDone", 1000);
+    LOGOS_ASSERT_EQ(legacyDone.name, std::string("storageDownloadDone"));
+
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    mockStorageSetNextDownloadChunkPayload(kPayload);
+    const StdLogosResult retry = impl->downloadToUrlV2(
+        "QmLegacyFirstCid", path, false, 64,
+        "download-operation-after-legacy", 64);
+    LOGOS_ASSERT_TRUE(retry.success);
+    const auto versionedDone = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(versionedDone.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(versionedDone.data).at("outcome").get<std::string>(),
+                    std::string("succeeded"));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
+}
+
+LOGOS_TEST(versioned_download_blocks_legacy_download_and_legacy_cancellation) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    auto* impl = createInitializedImpl(t);
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":32})");
+    const std::string path = "/tmp/logos-storage-v2-before-legacy";
+    fs::remove(path);
+    mockStorageHoldNextDownloadChunk();
+
+    const StdLogosResult versioned = impl->downloadToUrlV2(
+        "QmVersionedFirstCid", path, false, 64,
+        "download-operation-before-legacy", 64);
+    LOGOS_ASSERT_TRUE(versioned.success);
+    LOGOS_ASSERT(mockStorageWaitForHeldDownloadChunk(1000));
+    const int initCalls = t.cFunctionCallCount("storage_download_init");
+
+    const StdLogosResult legacy = impl->downloadChunks("QmVersionedFirstCid", false, 64);
+    LOGOS_ASSERT_FALSE(legacy.success);
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_download_init"), initCalls);
+    const StdLogosResult legacyCancel = impl->downloadCancel("QmVersionedFirstCid");
+    LOGOS_ASSERT_FALSE(legacyCancel.success);
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_cancel"));
+
+    LOGOS_ASSERT_TRUE(impl->downloadCancelV2("download-operation-before-legacy").success);
+    mockStorageCompleteHeldDownloadChunk(RET_OK, nullptr, nullptr);
+    const auto versionedDone = events.waitFor("storageDownloadDoneV2", 1000);
+    LOGOS_ASSERT_EQ(versionedDone.name, std::string("storageDownloadDoneV2"));
+    LOGOS_ASSERT_EQ(json::parse(versionedDone.data).at("outcome").get<std::string>(),
+                    std::string("canceled"));
+
+    const StdLogosResult retry = impl->downloadChunks("QmVersionedFirstCid", false, 64);
+    LOGOS_ASSERT_TRUE(retry.success);
+    const auto legacyDone = events.waitFor("storageDownloadDone", 1000);
+    LOGOS_ASSERT_EQ(legacyDone.name, std::string("storageDownloadDone"));
+
+    impl->destroy();
+    delete impl;
+    fs::remove(path);
 }
 
 LOGOS_TEST(downloadToUrlV2_reports_terminal_failure_after_chunk_dispatch_failure) {

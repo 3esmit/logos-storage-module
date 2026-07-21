@@ -155,6 +155,12 @@ static void syncCallback(int ret, const char* msg, size_t len, void* userData) {
 static constexpr int64_t DEFAULT_CHUNK_SIZE = 65536;
 static constexpr int DOWNLOAD_PROTOCOL_VERSION = 2;
 static constexpr int DOWNLOAD_CANCEL_TIMEOUT_MS = 15000;
+#if defined(STORAGE_MODULE_TEST_CANCEL_WAIT_TIMEOUT_MS)
+static constexpr int DOWNLOAD_CANCEL_WAIT_TIMEOUT_MS =
+    STORAGE_MODULE_TEST_CANCEL_WAIT_TIMEOUT_MS;
+#else
+static constexpr int DOWNLOAD_CANCEL_WAIT_TIMEOUT_MS = DOWNLOAD_CANCEL_TIMEOUT_MS;
+#endif
 static constexpr int DOWNLOAD_CHUNK_TIMEOUT_MS = 60000;
 static constexpr int MAX_DOWNLOAD_V2_BYTES = 1073741824;
 static constexpr int MAX_DOWNLOAD_V2_CHUNK_BYTES = 1048576;
@@ -199,10 +205,170 @@ static fs::path downloadV2StagingPath(const std::string& destinationPath) {
            + std::to_string(timestamp) + "-" + std::to_string(serial) + ".part");
 }
 
+enum class DownloadOwner {
+    Legacy,
+    Versioned,
+};
+
+enum class DownloadPhase {
+    Initializing,
+    Active,
+    AwaitingLateInit,
+    Cleaning,
+};
+
+struct DownloadLease {
+    std::string cid;
+    DownloadOwner owner;
+    std::string operationId;
+    DownloadPhase phase = DownloadPhase::Initializing;
+};
+
+struct DownloadRegistry;
+
+// A V2 transfer uses one libstorage chunk request at a time. This keeps the
+// storage worker free between chunks, which is necessary because libstorage
+// cannot cancel a stream-mode download while its worker is busy.
+struct DownloadV2State {
+    std::string cid;
+    std::string operationId;
+    std::shared_ptr<DownloadRegistry> registry;
+    std::shared_ptr<DownloadLease> lease;
+    std::mutex mutex;
+    std::condition_variable initializationReady;
+    std::condition_variable cancellationReady;
+    bool initializationResolved = false;
+    bool initializationSucceeded = false;
+    std::string initializationError;
+    bool dispatchResolved = false;
+    bool dispatchAccepted = false;
+    bool shutdownRequested = false;
+    bool cancellationRequested = false;
+    bool cancellationBeforeInitialization = false;
+    bool cancellationDispatched = false;
+    bool cancellationResolved = false;
+    bool cancellationSucceeded = false;
+    std::string cancellationError;
+    bool releaseLeaseOnCancellationConfirmation = false;
+    std::atomic<bool> workerFinished{false};
+};
+
+struct TerminalDownloadV2 {
+    std::string cid;
+    std::string outcome;
+};
+
+struct DownloadRegistry {
+    std::mutex mutex;
+    bool closing = false;
+    std::unordered_map<std::string, std::shared_ptr<DownloadLease>> leasesByCid;
+    std::unordered_set<std::string> pendingOperationIdsV2;
+    std::unordered_map<std::string, std::shared_ptr<DownloadV2State>> activeDownloadsV2;
+    std::unordered_map<std::string, TerminalDownloadV2> terminalDownloadsV2;
+    std::deque<std::string> terminalDownloadOrderV2;
+    std::vector<std::thread> cleanupWorkers;
+};
+
+static std::shared_ptr<DownloadLease> reserveDownloadLease(
+    const std::shared_ptr<DownloadRegistry>& registry, const std::string& cid,
+    DownloadOwner owner, const std::string& operationId, std::string& error) {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (registry->closing) {
+        error = "Storage context is shutting down.";
+        return {};
+    }
+    const auto existing = registry->leasesByCid.find(cid);
+    if (existing != registry->leasesByCid.end()) {
+        error = existing->second->phase == DownloadPhase::Initializing
+                || existing->second->phase == DownloadPhase::AwaitingLateInit
+            ? "A download for this CID is already starting."
+            : "A download for this CID is already active.";
+        return {};
+    }
+    if (owner == DownloadOwner::Versioned
+        && (registry->pendingOperationIdsV2.find(operationId)
+                != registry->pendingOperationIdsV2.end()
+            || registry->activeDownloadsV2.find(operationId)
+                != registry->activeDownloadsV2.end()
+            || registry->terminalDownloadsV2.find(operationId)
+                != registry->terminalDownloadsV2.end())) {
+        error = "Download operation ID is already in use.";
+        return {};
+    }
+
+    auto lease = std::make_shared<DownloadLease>(
+        DownloadLease{cid, owner, operationId, DownloadPhase::Initializing});
+    registry->leasesByCid.emplace(cid, lease);
+    if (owner == DownloadOwner::Versioned) {
+        registry->pendingOperationIdsV2.insert(operationId);
+    }
+    return lease;
+}
+
+static void releaseDownloadLease(const std::shared_ptr<DownloadRegistry>& registry,
+                                 const std::shared_ptr<DownloadLease>& lease) {
+    if (!registry || !lease) return;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    const auto current = registry->leasesByCid.find(lease->cid);
+    if (current != registry->leasesByCid.end() && current->second == lease) {
+        registry->leasesByCid.erase(current);
+    }
+    if (lease->owner == DownloadOwner::Versioned) {
+        registry->pendingOperationIdsV2.erase(lease->operationId);
+    }
+}
+
+static void setDownloadLeasePhase(const std::shared_ptr<DownloadRegistry>& registry,
+                                  const std::shared_ptr<DownloadLease>& lease,
+                                  DownloadPhase phase) {
+    if (!registry || !lease) return;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    const auto current = registry->leasesByCid.find(lease->cid);
+    if (current != registry->leasesByCid.end() && current->second == lease) {
+        lease->phase = phase;
+    }
+}
+
+static bool isDownloadRegistryClosing(const std::shared_ptr<DownloadRegistry>& registry) {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    return registry->closing;
+}
+
+static void closeDownloadRegistry(const std::shared_ptr<DownloadRegistry>& registry) {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    registry->closing = true;
+}
+
+static bool activateDownloadV2(const std::shared_ptr<DownloadV2State>& state) {
+    const auto& registry = state->registry;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (registry->closing) return false;
+    registry->pendingOperationIdsV2.erase(state->operationId);
+    registry->activeDownloadsV2[state->operationId] = state;
+    return true;
+}
+
+static void abandonDownloadV2Start(const std::shared_ptr<DownloadV2State>& state) {
+    const auto& registry = state->registry;
+    {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        const auto active = registry->activeDownloadsV2.find(state->operationId);
+        if (active != registry->activeDownloadsV2.end() && active->second == state) {
+            registry->activeDownloadsV2.erase(active);
+        }
+    }
+    releaseDownloadLease(registry, state->lease);
+    state->workerFinished.store(true);
+}
+
 struct SyncResult {
     bool ok = false;
     std::string message;
 };
+
+static void enqueueDownloadLeaseCleanup(
+    void* storageCtx, const std::shared_ptr<DownloadRegistry>& registry,
+    const std::shared_ptr<DownloadLease>& lease);
 
 // Wait for a SyncCtx to be signalled (or time out).
 // Returns the result and handles the abandoned-flag cleanup.
@@ -415,15 +581,29 @@ struct DownloadStreamCtx : AsyncCallbackBase {
     StorageModuleImpl* impl;
     std::string cid;
     std::string filepath;
+    std::shared_ptr<DownloadRegistry> registry;
+    std::shared_ptr<DownloadLease> lease;
+    std::atomic<unsigned int> references{2};
+    std::mutex dispatchMutex;
+    bool dispatchResolved = false;
+    bool dispatchAccepted = false;
+    bool terminalReceived = false;
     int64_t totalBytes;
     mutable int64_t bytesDownloaded = 0;
     mutable int64_t pendingBytes = 0;
     mutable int lastEmittedPercent = -1;
 
     DownloadStreamCtx(StorageModuleImpl* i, std::string c, std::string fp,
-                      int64_t total = 0)
-        : impl(i), cid(std::move(c)), filepath(std::move(fp)),
-          totalBytes(total) {}
+                      std::shared_ptr<DownloadRegistry> r,
+                      std::shared_ptr<DownloadLease> l, int64_t total = 0)
+        : impl(i), cid(std::move(c)), filepath(std::move(fp)), registry(std::move(r)),
+          lease(std::move(l)), totalBytes(total) {}
+
+    void releaseReference() {
+        if (references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete this;
+        }
+    }
 
     void handleResponse(int ret, const char* msg, size_t len) override {
         if (ret == RET_PROGRESS) {
@@ -459,21 +639,22 @@ struct DownloadStreamCtx : AsyncCallbackBase {
     }
 };
 
-// A V2 transfer uses one libstorage chunk request at a time. This keeps the
-// storage worker free between chunks, which is necessary because libstorage
-// cannot cancel a stream-mode download while its worker is busy.
-struct DownloadV2State {
-    std::string cid;
-    std::string operationId;
-    std::mutex mutex;
-    std::condition_variable cancellationReady;
-    bool cancellationRequested = false;
-    bool cancellationDispatched = false;
-    bool cancellationResolved = false;
-    bool cancellationSucceeded = false;
-    std::string cancellationError;
-    std::atomic<bool> workerFinished{false};
-};
+static void legacyDownloadStreamCallback(int ret, const char* msg, size_t len,
+                                         void* userData) {
+    if (!userData) return;
+    auto* ctx = static_cast<DownloadStreamCtx*>(userData);
+    ctx->handleResponse(ret, msg, len);
+    if (ret == RET_PROGRESS) return;
+
+    bool releaseLease = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx->dispatchMutex);
+        ctx->terminalReceived = true;
+        releaseLease = ctx->dispatchResolved && ctx->dispatchAccepted;
+    }
+    if (releaseLease) releaseDownloadLease(ctx->registry, ctx->lease);
+    ctx->releaseReference();
+}
 
 struct DownloadV2CancelCtx {
     std::shared_ptr<DownloadV2State> state;
@@ -483,6 +664,7 @@ static void downloadV2CancelCallback(int ret, const char* msg, size_t len,
                                      void* userData) {
     if (!userData || ret == RET_PROGRESS) return;
     auto* ctx = static_cast<DownloadV2CancelCtx*>(userData);
+    bool releaseLease = false;
     {
         std::lock_guard<std::mutex> lock(ctx->state->mutex);
         ctx->state->cancellationResolved = true;
@@ -490,8 +672,16 @@ static void downloadV2CancelCallback(int ret, const char* msg, size_t len,
         ctx->state->cancellationError = ret == RET_OK
             ? std::string()
             : fromMsg(msg, len);
+        if (ret == RET_OK
+            && ctx->state->releaseLeaseOnCancellationConfirmation) {
+            ctx->state->releaseLeaseOnCancellationConfirmation = false;
+            releaseLease = true;
+        }
     }
     ctx->state->cancellationReady.notify_all();
+    if (releaseLease) {
+        releaseDownloadLease(ctx->state->registry, ctx->state->lease);
+    }
     delete ctx;
 }
 
@@ -521,8 +711,9 @@ static bool requestDownloadV2Cancellation(
     auto* ctx = new DownloadV2CancelCtx{state};
     if (storage_download_cancel(storageCtx, state->cid.c_str(),
                                 downloadV2CancelCallback, ctx) != RET_OK) {
-        delete ctx;
-        resolveDispatchFailure("Failed to send download cancellation.");
+        // libstorage invokes the error callback synchronously before returning
+        // RET_ERR. The callback owns and deletes ctx in both success and
+        // failure cases, so deleting it here would double-free the context.
         return false;
     }
     return true;
@@ -532,7 +723,7 @@ static SyncResult waitForDownloadV2Cancellation(
     const std::shared_ptr<DownloadV2State>& state) {
     std::unique_lock<std::mutex> lock(state->mutex);
     if (!state->cancellationReady.wait_for(
-            lock, std::chrono::milliseconds(DOWNLOAD_CANCEL_TIMEOUT_MS),
+            lock, std::chrono::milliseconds(DOWNLOAD_CANCEL_WAIT_TIMEOUT_MS),
             [&state] { return state->cancellationResolved; })) {
         return {false, "Timed out waiting for download cancellation."};
     }
@@ -542,6 +733,37 @@ static SyncResult waitForDownloadV2Cancellation(
                 : state->cancellationError};
     }
     return {true, {}};
+}
+
+struct DownloadV2InitCtx {
+    std::shared_ptr<DownloadV2State> state;
+    void* storageCtx;
+};
+
+static void downloadV2InitCallback(int ret, const char* msg, size_t len,
+                                   void* userData) {
+    if (!userData || ret == RET_PROGRESS) return;
+    auto* ctx = static_cast<DownloadV2InitCtx*>(userData);
+    bool canceledBeforeInitialization = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx->state->mutex);
+        ctx->state->initializationResolved = true;
+        ctx->state->initializationSucceeded = ret == RET_OK;
+        ctx->state->initializationError = ret == RET_OK
+            ? std::string()
+            : fromMsg(msg, len);
+        canceledBeforeInitialization = ctx->state->cancellationBeforeInitialization;
+    }
+    ctx->state->initializationReady.notify_all();
+    if (canceledBeforeInitialization) {
+        if (ret == RET_OK) {
+            enqueueDownloadLeaseCleanup(ctx->storageCtx, ctx->state->registry,
+                                        ctx->state->lease);
+        } else {
+            releaseDownloadLease(ctx->state->registry, ctx->state->lease);
+        }
+    }
+    delete ctx;
 }
 
 struct DownloadV2ChunkCtx {
@@ -709,8 +931,6 @@ using StorageNoArgFn = int (*)(void*, StorageCallback, void*);
 using StorageBoolFn = int (*)(void*, bool, StorageCallback, void*);
 using StorageStringFn = int (*)(void*, const char*, StorageCallback, void*);
 using StorageStringIntFn = int (*)(void*, const char*, size_t, StorageCallback, void*);
-using StorageDownloadInitFn =
-    int (*)(void*, const char*, size_t, bool, StorageCallback, void*);
 
 static SyncResult syncCallNoArg(void* ctx, StorageNoArgFn fn, int timeoutMs) {
     if (!ctx) return {false, "Storage context not initialized."};
@@ -757,25 +977,195 @@ static SyncResult syncCallStringAndSize(void* ctx, StorageStringIntFn fn,
     return waitSync(sctx, timeoutMs);
 }
 
-static SyncResult syncCallDownloadInit(void* ctx, StorageDownloadInitFn fn,
-                                        const std::string& cid, size_t chunkSize,
-                                        bool local, int timeoutMs) {
-    if (!ctx) return {false, "Storage context not initialized."};
-    auto* sctx = new SyncCtx();
-    sctx->lifetimeArg = cid;
-    if (fn(ctx, sctx->lifetimeArg.c_str(), chunkSize, local, syncCallback, sctx) !=
-        RET_OK) {
-        delete sctx;
-        return {false, "Failed to send command."};
+struct DownloadLeaseCleanupCtx {
+    std::shared_ptr<DownloadRegistry> registry;
+    std::shared_ptr<DownloadLease> lease;
+};
+
+static void downloadLeaseCleanupCallback(int ret, const char*, size_t,
+                                         void* userData) {
+    if (!userData || ret == RET_PROGRESS) return;
+    auto* ctx = static_cast<DownloadLeaseCleanupCtx*>(userData);
+    if (ret == RET_OK) {
+        releaseDownloadLease(ctx->registry, ctx->lease);
+    } else {
+        setDownloadLeasePhase(ctx->registry, ctx->lease, DownloadPhase::Cleaning);
     }
-    return waitSync(sctx, timeoutMs);
+    delete ctx;
+}
+
+static void enqueueDownloadLeaseCleanup(
+    void* storageCtx, const std::shared_ptr<DownloadRegistry>& registry,
+    const std::shared_ptr<DownloadLease>& lease) {
+    if (!registry || !lease) return;
+
+    bool releaseWithoutCancel = false;
+    try {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        if (!storageCtx || registry->closing) {
+            releaseWithoutCancel = true;
+        } else {
+            const auto current = registry->leasesByCid.find(lease->cid);
+            if (current != registry->leasesByCid.end() && current->second == lease) {
+                lease->phase = DownloadPhase::Cleaning;
+            }
+            registry->cleanupWorkers.emplace_back([storageCtx, registry, lease] {
+                if (isDownloadRegistryClosing(registry)) {
+                    releaseDownloadLease(registry, lease);
+                    return;
+                }
+                try {
+                    auto* ctx = new DownloadLeaseCleanupCtx{registry, lease};
+                    // The libstorage callback owns ctx for both success and
+                    // immediate dispatch failure. Do not block its worker.
+                    (void)storage_download_cancel(storageCtx, lease->cid.c_str(),
+                                                  downloadLeaseCleanupCallback, ctx);
+                } catch (const std::exception&) {
+                    setDownloadLeasePhase(registry, lease, DownloadPhase::Cleaning);
+                }
+            });
+        }
+    } catch (const std::exception&) {
+        setDownloadLeasePhase(registry, lease, DownloadPhase::Cleaning);
+    }
+    if (releaseWithoutCancel) releaseDownloadLease(registry, lease);
+}
+
+static void joinDownloadLeaseCleanupWorkers(
+    const std::shared_ptr<DownloadRegistry>& registry) {
+    std::vector<std::thread> workers;
+    {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        workers.swap(registry->cleanupWorkers);
+    }
+    for (std::thread& worker : workers) {
+        if (worker.joinable()) worker.join();
+    }
+}
+
+static void finalizeLegacyDownloadStreamDispatch(DownloadStreamCtx* ctx,
+                                                 void* storageCtx, int dispatch) {
+    bool terminalReceived = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx->dispatchMutex);
+        ctx->dispatchResolved = true;
+        ctx->dispatchAccepted = dispatch == RET_OK;
+        terminalReceived = ctx->terminalReceived;
+    }
+    if (dispatch == RET_OK && terminalReceived) {
+        releaseDownloadLease(ctx->registry, ctx->lease);
+    } else if (dispatch != RET_OK) {
+        const SyncResult cleanup = syncCallString(
+            storageCtx, storage_download_cancel, ctx->cid, 1000);
+        if (cleanup.ok) {
+            releaseDownloadLease(ctx->registry, ctx->lease);
+        } else {
+            setDownloadLeasePhase(ctx->registry, ctx->lease, DownloadPhase::Cleaning);
+        }
+    }
+    ctx->releaseReference();
+}
+
+struct LegacyDownloadInitCtx {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::shared_ptr<DownloadRegistry> registry;
+    std::shared_ptr<DownloadLease> lease;
+    void* storageCtx;
+    bool received = false;
+    bool timedOut = false;
+    int resultCode = RET_ERR;
+    std::string resultMessage;
+};
+
+struct LegacyDownloadInitResult {
+    bool ok = false;
+    bool timedOut = false;
+    std::string message;
+};
+
+static void legacyDownloadInitCallback(int ret, const char* msg, size_t len,
+                                       void* userData) {
+    if (!userData || ret == RET_PROGRESS) return;
+    auto* ctx = static_cast<LegacyDownloadInitCtx*>(userData);
+    bool timedOut = false;
+    std::shared_ptr<DownloadRegistry> registry;
+    std::shared_ptr<DownloadLease> lease;
+    void* storageCtx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->received = true;
+        ctx->resultCode = ret;
+        ctx->resultMessage = fromMsg(msg, len);
+        timedOut = ctx->timedOut;
+        if (timedOut) {
+            registry = ctx->registry;
+            lease = ctx->lease;
+            storageCtx = ctx->storageCtx;
+        }
+        ctx->ready.notify_all();
+    }
+    if (!timedOut) return;
+
+    if (ret == RET_OK) {
+        setDownloadLeasePhase(registry, lease, DownloadPhase::Cleaning);
+        enqueueDownloadLeaseCleanup(storageCtx, registry, lease);
+    } else {
+        releaseDownloadLease(registry, lease);
+    }
+    delete ctx;
+}
+
+static LegacyDownloadInitResult waitForLegacyDownloadInit(
+    LegacyDownloadInitCtx* ctx, int timeoutMs) {
+    LegacyDownloadInitResult result;
+    bool deleteContext = false;
+    {
+        std::unique_lock<std::mutex> lock(ctx->mutex);
+        ctx->ready.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                            [ctx] { return ctx->received; });
+        if (ctx->received) {
+            result.ok = ctx->resultCode == RET_OK;
+            result.message = ctx->resultMessage;
+            deleteContext = true;
+        } else {
+            ctx->timedOut = true;
+            result.timedOut = true;
+            result.message = "Timed out waiting for download initialization.";
+            setDownloadLeasePhase(ctx->registry, ctx->lease,
+                                  DownloadPhase::AwaitingLateInit);
+        }
+    }
+    if (deleteContext) delete ctx;
+    return result;
+}
+
+static LegacyDownloadInitResult startLegacyDownloadInit(
+    void* storageCtx, const std::string& cid, size_t chunkSize, bool local,
+    const std::shared_ptr<DownloadRegistry>& registry,
+    const std::shared_ptr<DownloadLease>& lease, int timeoutMs) {
+    if (!storageCtx) return {false, false, "Storage context not initialized."};
+    auto* ctx = new LegacyDownloadInitCtx{
+        {}, {}, registry, lease, storageCtx, false, false, RET_ERR, {}};
+    if (storage_download_init(storageCtx, cid.c_str(), chunkSize, local,
+                              legacyDownloadInitCallback, ctx) != RET_OK) {
+        std::string error = "Failed to send download initialization.";
+        {
+            std::lock_guard<std::mutex> lock(ctx->mutex);
+            if (!ctx->resultMessage.empty()) error = ctx->resultMessage;
+        }
+        delete ctx;
+        return {false, false, error};
+    }
+    return waitForLegacyDownloadInit(ctx, timeoutMs);
 }
 
 // ---------------------------------------------------------------------------
 // StorageModuleImpl
 // ---------------------------------------------------------------------------
 
-StorageModuleImpl::StorageModuleImpl() : storageCtx(nullptr) {
+StorageModuleImpl::StorageModuleImpl()
+    : storageCtx(nullptr), downloadRegistry(std::make_shared<DownloadRegistry>()) {
     fprintf(stderr, "StorageModuleImpl: Initializing...\n");
 }
 
@@ -1028,7 +1418,16 @@ std::string StorageModuleImpl::downloadChunksInternal(const std::string& cid,
                                                        const std::string& filepath,
                                                        bool local,
                                                        int64_t chunkSize) {
-    if (!storageCtx || chunkSize <= 0) return {};
+    if (!storageCtx || chunkSize <= 0 || chunkSize > MAX_DOWNLOAD_V2_CHUNK_BYTES
+        || cid.empty() || containsEmbeddedNul(cid)
+        || containsEmbeddedNul(filepath)) {
+        return {};
+    }
+
+    std::string reserveError;
+    const auto lease = reserveDownloadLease(downloadRegistry, cid, DownloadOwner::Legacy,
+                                            {}, reserveError);
+    if (!lease) return {};
 
     // For file-mode download, fetch the manifest to determine total size so
     // that progress events can be throttled to one per percentage point.
@@ -1059,21 +1458,25 @@ std::string StorageModuleImpl::downloadChunksInternal(const std::string& cid,
                     "StorageModuleImpl::downloadChunksInternal: failed to get "
                     "manifest for %s\n",
                     cid.c_str());
+            releaseDownloadLease(downloadRegistry, lease);
             return {};
         }
     }
 
-    auto r = syncCallDownloadInit(storageCtx, storage_download_init, cid,
-                                  static_cast<size_t>(chunkSize), local, 1000);
-    if (!r.ok) return {};
+    const auto initialized = startLegacyDownloadInit(
+        storageCtx, cid, static_cast<size_t>(chunkSize), local, downloadRegistry, lease, 1000);
+    if (!initialized.ok) {
+        if (!initialized.timedOut) releaseDownloadLease(downloadRegistry, lease);
+        return {};
+    }
+    setDownloadLeasePhase(downloadRegistry, lease, DownloadPhase::Active);
 
-    auto* ctx = new DownloadStreamCtx(this, cid, filepath, totalBytes);
-    if (storage_download_stream(storageCtx, ctx->cid.c_str(),
-                                static_cast<size_t>(chunkSize), local,
-                                ctx->filepath.c_str(),
-                                asyncCallback, ctx) != RET_OK) {
-        delete ctx;
-        syncCallString(storageCtx, storage_download_cancel, cid, 1000);
+    auto* ctx = new DownloadStreamCtx(this, cid, filepath, downloadRegistry, lease, totalBytes);
+    const int dispatch = storage_download_stream(
+        storageCtx, ctx->cid.c_str(), static_cast<size_t>(chunkSize), local,
+        ctx->filepath.c_str(), legacyDownloadStreamCallback, ctx);
+    finalizeLegacyDownloadStreamDispatch(ctx, storageCtx, dispatch);
+    if (dispatch != RET_OK) {
         return {};
     }
     return cid;
@@ -1097,6 +1500,19 @@ StdLogosResult StorageModuleImpl::downloadChunks(const std::string& cid, bool lo
 }
 
 StdLogosResult StorageModuleImpl::downloadCancel(const std::string& sessionId) {
+    if (!storageCtx) return {false, {}, "Storage context not initialized."};
+    if (sessionId.empty() || containsEmbeddedNul(sessionId)) {
+        return {false, {}, "Invalid download session ID."};
+    }
+    {
+        std::lock_guard<std::mutex> lock(downloadRegistry->mutex);
+        const auto lease = downloadRegistry->leasesByCid.find(sessionId);
+        if (lease != downloadRegistry->leasesByCid.end()
+            && lease->second->owner == DownloadOwner::Versioned) {
+            return {false, {},
+                    "A versioned download is active; cancel it by module operation ID."};
+        }
+    }
     auto r = syncCallString(storageCtx, storage_download_cancel, sessionId, 1000);
     if (!r.ok) return {false, {}, r.message};
     return {true, {}, ""};
@@ -1126,43 +1542,24 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
         || operationId.find_first_of(" \t\r\n") != std::string::npos || operationId == cid
         || chunkSize <= 0 || maxDownloadBytes <= 0
         || maxDownloadBytes > MAX_DOWNLOAD_V2_BYTES
-        || chunkSize > MAX_DOWNLOAD_V2_CHUNK_BYTES
-        || chunkSize > maxDownloadBytes) {
+        || chunkSize > MAX_DOWNLOAD_V2_CHUNK_BYTES) {
         return {false, {}, "Invalid versioned download arguments."};
     }
+    const int effectiveChunkSize = std::min(chunkSize, maxDownloadBytes);
 
-    {
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        if (pendingDownloadOperationIdsV2.find(operationId)
-                != pendingDownloadOperationIdsV2.end()
-            || activeDownloadsV2.find(operationId) != activeDownloadsV2.end()
-            || terminalDownloadsV2.find(operationId) != terminalDownloadsV2.end()) {
-            return {false, {}, "Download operation ID is already in use."};
-        }
-        if (pendingDownloadCidsV2.find(cid) != pendingDownloadCidsV2.end()) {
-            return {false, {}, "A download for this CID is already starting."};
-        }
-        for (const auto& active : activeDownloadsV2) {
-            if (active.second.cid == cid) {
-                return {false, {}, "A download for this CID is already active."};
-            }
-        }
-        pendingDownloadOperationIdsV2.insert(operationId);
-        pendingDownloadCidsV2.insert(cid);
-    }
+    std::string reserveError;
+    const auto lease = reserveDownloadLease(downloadRegistry, cid, DownloadOwner::Versioned,
+                                            operationId, reserveError);
+    if (!lease) return {false, {}, reserveError};
 
     const auto manifest = syncCallString(storageCtx, storage_download_manifest, cid, 3000);
     uint64_t manifestBytes = 0;
     if (!manifest.ok || !manifestDatasetSize(manifest.message, manifestBytes)) {
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        pendingDownloadOperationIdsV2.erase(operationId);
-        pendingDownloadCidsV2.erase(cid);
+        releaseDownloadLease(downloadRegistry, lease);
         return {false, {}, "Failed to read download manifest."};
     }
     if (manifestBytes > static_cast<uint64_t>(maxDownloadBytes)) {
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        pendingDownloadOperationIdsV2.erase(operationId);
-        pendingDownloadCidsV2.erase(cid);
+        releaseDownloadLease(downloadRegistry, lease);
         return {false, {}, "Download exceeds requested byte limit."};
     }
 
@@ -1170,50 +1567,82 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
     {
         std::ofstream probe(stagingPath, std::ios::binary | std::ios::trunc);
         if (!probe) {
-            std::lock_guard<std::mutex> lock(downloadV2Mutex);
-            pendingDownloadOperationIdsV2.erase(operationId);
-            pendingDownloadCidsV2.erase(cid);
+            releaseDownloadLease(downloadRegistry, lease);
             return {false, {}, "Failed to open download staging file."};
         }
-    }
-
-    const auto initialized = syncCallDownloadInit(
-        storageCtx, storage_download_init, cid, static_cast<size_t>(chunkSize), local, 1000);
-    if (!initialized.ok) {
-        std::error_code ec;
-        fs::remove(stagingPath, ec);
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        pendingDownloadOperationIdsV2.erase(operationId);
-        pendingDownloadCidsV2.erase(cid);
-        return {false, {}, initialized.message};
     }
 
     auto state = std::make_shared<DownloadV2State>();
     state->cid = cid;
     state->operationId = operationId;
-    {
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        pendingDownloadOperationIdsV2.erase(operationId);
-        pendingDownloadCidsV2.erase(cid);
-        activeDownloadsV2.emplace(operationId, ActiveDownloadV2{cid, state});
+    state->registry = downloadRegistry;
+    state->lease = lease;
+    if (!activateDownloadV2(state)) {
+        std::error_code ec;
+        fs::remove(stagingPath, ec);
+        releaseDownloadLease(downloadRegistry, lease);
+        return {false, {}, "Storage context is shutting down."};
     }
 
     try {
-        std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);
-        downloadV2Workers.reserve(downloadV2Workers.size() + 1);
-        std::thread worker(&StorageModuleImpl::runDownloadV2, this, state,
-                           stagingPath.string(), filePath, chunkSize, manifestBytes,
-                           static_cast<uint64_t>(maxDownloadBytes));
-        downloadV2Workers.push_back({state, std::move(worker)});
-    } catch (const std::exception&) {
         {
-            std::lock_guard<std::mutex> lock(downloadV2Mutex);
-            activeDownloadsV2.erase(operationId);
+            std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);
+            downloadV2Workers.reserve(downloadV2Workers.size() + 1);
         }
-        syncCallString(storageCtx, storage_download_cancel, cid, 1000);
+        std::thread worker(&StorageModuleImpl::runDownloadV2, this, state,
+                           stagingPath.string(), filePath, effectiveChunkSize, manifestBytes,
+                           static_cast<uint64_t>(maxDownloadBytes));
+        {
+            std::lock_guard<std::mutex> lock(downloadV2WorkersMutex);
+            downloadV2Workers.push_back({state, std::move(worker)});
+        }
+    } catch (const std::exception&) {
+        abandonDownloadV2Start(state);
         std::error_code ec;
         fs::remove(stagingPath, ec);
         return {false, {}, "Failed to start versioned download worker."};
+    }
+
+    DownloadV2InitCtx* initCtx = nullptr;
+    try {
+        initCtx = new DownloadV2InitCtx{state, storageCtx};
+    } catch (const std::exception&) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->dispatchResolved = true;
+            state->dispatchAccepted = false;
+            state->initializationResolved = true;
+            state->initializationSucceeded = false;
+            state->initializationError = "Failed to allocate download initialization state.";
+        }
+        state->initializationReady.notify_all();
+        abandonDownloadV2Start(state);
+        std::error_code ec;
+        fs::remove(stagingPath, ec);
+        return {false, {}, "Failed to start versioned download."};
+    }
+    const int dispatch = storage_download_init(
+        storageCtx, cid.c_str(), static_cast<size_t>(effectiveChunkSize), local,
+        downloadV2InitCallback, initCtx);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->dispatchResolved = true;
+        state->dispatchAccepted = dispatch == RET_OK;
+        if (dispatch != RET_OK && !state->initializationResolved) {
+            state->initializationResolved = true;
+            state->initializationSucceeded = false;
+            state->initializationError = "Failed to send download initialization.";
+        }
+    }
+    state->initializationReady.notify_all();
+    if (dispatch != RET_OK) {
+        // libstorage reports dispatch errors through downloadV2InitCallback,
+        // which owns initCtx. Release routing state before returning so a
+        // caller can immediately retry this CID or operation ID.
+        abandonDownloadV2Start(state);
+        std::error_code ec;
+        fs::remove(stagingPath, ec);
+        return {false, {}, "Failed to send download initialization."};
     }
 
     return {true,
@@ -1236,11 +1665,11 @@ StdLogosResult StorageModuleImpl::downloadCancelV2(const std::string& operationI
     std::string cid;
     std::shared_ptr<DownloadV2State> state;
     {
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        const auto active = activeDownloadsV2.find(operationId);
-        if (active == activeDownloadsV2.end()) {
-            const auto terminal = terminalDownloadsV2.find(operationId);
-            if (terminal == terminalDownloadsV2.end()) {
+        std::lock_guard<std::mutex> lock(downloadRegistry->mutex);
+        const auto active = downloadRegistry->activeDownloadsV2.find(operationId);
+        if (active == downloadRegistry->activeDownloadsV2.end()) {
+            const auto terminal = downloadRegistry->terminalDownloadsV2.find(operationId);
+            if (terminal == downloadRegistry->terminalDownloadsV2.end()) {
                 return {true,
                         json{
                             {"protocol", "logos.storage.download"},
@@ -1261,15 +1690,40 @@ StdLogosResult StorageModuleImpl::downloadCancelV2(const std::string& operationI
                     },
                         ""};
         }
-        cid = active->second.cid;
-        state = active->second.state;
+        cid = active->second->cid;
+        state = active->second;
     }
 
+    bool initializationPending = false;
+    bool initializationFailed = false;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->cancellationRequested = true;
+        initializationPending = !state->initializationResolved;
+        state->cancellationBeforeInitialization = initializationPending;
+        initializationFailed = state->initializationResolved
+            && !state->initializationSucceeded;
     }
-    if (!requestDownloadV2Cancellation(storageCtx, state)) {
+    if (initializationPending) {
+        // An initialization callback may arrive much later. Report the caller's
+        // cancellation now, retain the CID lease, and clean up the late native
+        // session from a separate worker when that callback arrives.
+        setDownloadLeasePhase(downloadRegistry, state->lease,
+                              DownloadPhase::AwaitingLateInit);
+        state->initializationReady.notify_all();
+        finishDownloadV2(state, "canceled", {}, false);
+        return {true,
+                json{
+                    {"protocol", "logos.storage.download"},
+                    {"version", DOWNLOAD_PROTOCOL_VERSION},
+                    {"moduleOperationId", operationId},
+                    {"cid", cid},
+                    {"cancelStatus", "canceled"},
+                },
+                ""};
+    }
+    if (!initializationPending && !initializationFailed
+        && !requestDownloadV2Cancellation(storageCtx, state)) {
         std::lock_guard<std::mutex> lock(state->mutex);
         return {false, {}, state->cancellationError.empty()
                 ? "Failed to send download cancellation."
@@ -1291,11 +1745,56 @@ void StorageModuleImpl::runDownloadV2(
     const std::shared_ptr<DownloadV2State>& state, const std::string& stagingPath,
     const std::string& destinationPath, int chunkSize, uint64_t expectedBytes,
     uint64_t maxBytes) {
-    std::ofstream output(stagingPath, std::ios::binary | std::ios::trunc);
     auto removePartialFile = [&stagingPath] {
         std::error_code ec;
         fs::remove(stagingPath, ec);
     };
+    bool shutdownRequested = false;
+    bool dispatchAccepted = false;
+    bool initializationSucceeded = false;
+    bool cancellationBeforeInitialization = false;
+    bool cancellationWasRequested = false;
+    std::string initializationError;
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->initializationReady.wait(lock, [&state] {
+            return state->shutdownRequested
+                || state->cancellationBeforeInitialization
+                || (state->dispatchResolved && state->initializationResolved);
+        });
+        shutdownRequested = state->shutdownRequested;
+        dispatchAccepted = state->dispatchAccepted;
+        initializationSucceeded = state->initializationSucceeded;
+        cancellationBeforeInitialization = state->cancellationBeforeInitialization;
+        cancellationWasRequested = state->cancellationRequested;
+        initializationError = state->initializationError;
+    }
+    if (shutdownRequested || !dispatchAccepted) {
+        removePartialFile();
+        abandonDownloadV2Start(state);
+        return;
+    }
+    if (cancellationBeforeInitialization) {
+        removePartialFile();
+        state->workerFinished.store(true);
+        return;
+    }
+    if (!initializationSucceeded) {
+        removePartialFile();
+        if (cancellationWasRequested) {
+            finishDownloadV2(state, "canceled");
+        } else {
+            finishDownloadV2(
+                state, "failed",
+                initializationError.empty()
+                    ? "Failed to initialize versioned download."
+                    : initializationError);
+        }
+        return;
+    }
+    setDownloadLeasePhase(state->registry, state->lease, DownloadPhase::Active);
+
+    std::ofstream output(stagingPath, std::ios::binary | std::ios::trunc);
     auto cancellationRequested = [&state] {
         std::lock_guard<std::mutex> lock(state->mutex);
         return state->cancellationRequested;
@@ -1308,7 +1807,9 @@ void StorageModuleImpl::runDownloadV2(
         if (canceled.ok) {
             finishDownloadV2(state, "canceled");
         } else {
-            finishDownloadV2(state, "failed", canceled.message);
+            setDownloadLeasePhase(state->registry, state->lease,
+                                  DownloadPhase::Cleaning);
+            finishDownloadV2(state, "failed", canceled.message, false);
         }
     };
     auto fail = [&](const std::string& error, bool cancelSession) {
@@ -1327,7 +1828,13 @@ void StorageModuleImpl::runDownloadV2(
         if (!cancellation.ok) {
             failure += " Cleanup failed: " + cancellation.message;
         }
-        finishDownloadV2(state, "failed", failure);
+        if (!cancellation.ok && cancelSession) {
+            setDownloadLeasePhase(state->registry, state->lease,
+                                  DownloadPhase::Cleaning);
+            finishDownloadV2(state, "failed", failure, false);
+        } else {
+            finishDownloadV2(state, "failed", failure);
+        }
     };
 
     if (!output) {
@@ -1382,7 +1889,9 @@ void StorageModuleImpl::runDownloadV2(
             const SyncResult cleanup = waitForDownloadV2Cancellation(state);
             if (!cleanup.ok) {
                 removePartialFile();
-                finishDownloadV2(state, "failed", cleanup.message);
+                setDownloadLeasePhase(state->registry, state->lease,
+                                      DownloadPhase::Cleaning);
+                finishDownloadV2(state, "failed", cleanup.message, false);
                 return;
             }
             if (cancellationRequested()) {
@@ -1415,16 +1924,38 @@ void StorageModuleImpl::runDownloadV2(
 
 void StorageModuleImpl::finishDownloadV2(
     const std::shared_ptr<DownloadV2State>& state, const std::string& outcome,
-    const std::string& error) {
+    const std::string& error, bool releaseLease) {
+    bool releaseLeaseNow = releaseLease;
     {
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        activeDownloadsV2.erase(state->operationId);
-        terminalDownloadsV2[state->operationId] = {state->cid, outcome};
-        terminalDownloadOrderV2.push_back(state->operationId);
-        while (terminalDownloadOrderV2.size() > MAX_TERMINAL_DOWNLOADS_V2) {
-            const std::string expired = terminalDownloadOrderV2.front();
-            terminalDownloadOrderV2.pop_front();
-            terminalDownloadsV2.erase(expired);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!releaseLeaseNow && state->cancellationDispatched
+            && state->cancellationResolved && state->cancellationSucceeded) {
+            releaseLeaseNow = true;
+        }
+        state->releaseLeaseOnCancellationConfirmation =
+            !releaseLeaseNow && state->cancellationDispatched;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->registry->mutex);
+        const auto active = state->registry->activeDownloadsV2.find(state->operationId);
+        if (active != state->registry->activeDownloadsV2.end() && active->second == state) {
+            state->registry->activeDownloadsV2.erase(active);
+        }
+        if (releaseLeaseNow) {
+            const auto lease = state->registry->leasesByCid.find(state->cid);
+            if (lease != state->registry->leasesByCid.end()
+                && lease->second == state->lease) {
+                state->registry->leasesByCid.erase(lease);
+            }
+        }
+        state->registry->pendingOperationIdsV2.erase(state->operationId);
+        state->registry->terminalDownloadsV2[state->operationId] = {state->cid, outcome};
+        state->registry->terminalDownloadOrderV2.push_back(state->operationId);
+        while (state->registry->terminalDownloadOrderV2.size()
+               > MAX_TERMINAL_DOWNLOADS_V2) {
+            const std::string expired = state->registry->terminalDownloadOrderV2.front();
+            state->registry->terminalDownloadOrderV2.pop_front();
+            state->registry->terminalDownloadsV2.erase(expired);
         }
     }
 
@@ -1463,19 +1994,24 @@ void StorageModuleImpl::reapFinishedDownloadV2Workers() {
 }
 
 void StorageModuleImpl::cancelAndJoinDownloadV2Workers() {
+    closeDownloadRegistry(downloadRegistry);
     std::vector<std::shared_ptr<DownloadV2State>> active;
     {
-        std::lock_guard<std::mutex> lock(downloadV2Mutex);
-        for (const auto& entry : activeDownloadsV2) {
-            active.push_back(entry.second.state);
+        std::lock_guard<std::mutex> lock(downloadRegistry->mutex);
+        for (const auto& entry : downloadRegistry->activeDownloadsV2) {
+            active.push_back(entry.second);
         }
     }
     for (const auto& state : active) {
+        bool canCancel = false;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->cancellationRequested = true;
+            state->shutdownRequested = true;
+            canCancel = state->initializationResolved && state->initializationSucceeded;
         }
-        requestDownloadV2Cancellation(storageCtx, state);
+        state->initializationReady.notify_all();
+        if (canCancel) requestDownloadV2Cancellation(storageCtx, state);
     }
 
     std::vector<DownloadV2Worker> workers;
@@ -1486,6 +2022,7 @@ void StorageModuleImpl::cancelAndJoinDownloadV2Workers() {
     for (DownloadV2Worker& worker : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    joinDownloadLeaseCleanupWorkers(downloadRegistry);
 }
 
 // ---------------------------------------------------------------------------

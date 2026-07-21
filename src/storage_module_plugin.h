@@ -20,6 +20,7 @@ extern "C" {
 }
 
 struct DownloadV2State;
+struct DownloadRegistry;
 
 /// Logos Storage Module API.
 ///
@@ -275,7 +276,7 @@ public:
     /// `cid`       – content identifier to download.
     /// `filePath`  – destination path on disk.
     /// `local`     – if true, only reads from locally cached data (no network).
-    /// `chunkSize` – download chunk size in bytes (default 65536).
+    /// `chunkSize` – download chunk size in bytes (default 65536, maximum 1048576).
     ///
     /// Returns StdLogosResult::value as the session ID (= CID) on success.
     ///
@@ -292,7 +293,7 @@ public:
     ///
     /// `cid`       – content identifier to download.
     /// `local`     – if true, only reads from locally cached data (no network).
-    /// `chunkSize` – download chunk size in bytes (default 65536).
+    /// `chunkSize` – download chunk size in bytes (default 65536, maximum 1048576).
     ///
     /// Returns StdLogosResult::value as the session ID (= CID) on success.
     ///
@@ -316,7 +317,8 @@ public:
     ///   "version": 2,
     ///   "moduleOperationIdOwner": "caller",
     ///   "cancelTimeoutMs": 15000,
-    ///   "maxDownloadBytes": 1073741824
+    ///   "maxDownloadBytes": 1073741824,
+    ///   "maxChunkBytes": 1048576
     /// }
     /// @endcode
     ///
@@ -329,7 +331,9 @@ public:
     ///
     /// `operationId` must be a unique, non-empty caller-generated value and
     /// must not equal `cid`. `maxDownloadBytes` must be positive and no larger
-    /// than the limit advertised by downloadProtocol(). The manifest is checked
+    /// than the limit advertised by downloadProtocol(). `chunkSize` must be
+    /// positive and no larger than `maxChunkBytes`; it is capped to
+    /// `maxDownloadBytes` before native initialization. The manifest is checked
     /// before the download starts; oversized content is rejected before dispatch.
     /// Content is written to a sibling staging file and replaces `filePath` only
     /// after a successful terminal result. Failed or canceled downloads preserve
@@ -552,16 +556,6 @@ logos_events:
     /// @}
 
 private:
-    struct ActiveDownloadV2 {
-        std::string cid;
-        std::shared_ptr<DownloadV2State> state;
-    };
-
-    struct TerminalDownloadV2 {
-        std::string cid;
-        std::string outcome;
-    };
-
     struct DownloadV2Worker {
         std::shared_ptr<DownloadV2State> state;
         std::thread thread;
@@ -569,12 +563,7 @@ private:
 
     void* storageCtx;
 
-    std::mutex downloadV2Mutex;
-    std::unordered_set<std::string> pendingDownloadOperationIdsV2;
-    std::unordered_set<std::string> pendingDownloadCidsV2;
-    std::unordered_map<std::string, ActiveDownloadV2> activeDownloadsV2;
-    std::unordered_map<std::string, TerminalDownloadV2> terminalDownloadsV2;
-    std::deque<std::string> terminalDownloadOrderV2;
+    std::shared_ptr<DownloadRegistry> downloadRegistry;
     std::mutex downloadV2WorkersMutex;
     std::vector<DownloadV2Worker> downloadV2Workers;
 
@@ -584,7 +573,8 @@ private:
                        uint64_t expectedBytes, uint64_t maxBytes);
     void finishDownloadV2(const std::shared_ptr<DownloadV2State>& state,
                           const std::string& outcome,
-                          const std::string& error = {});
+                          const std::string& error = {},
+                          bool releaseLease = true);
     void reapFinishedDownloadV2Workers();
     void cancelAndJoinDownloadV2Workers();
 

@@ -23,7 +23,8 @@ logos_test(
         stubs
 )
 target_compile_definitions(storage_module_tests PRIVATE
-    STORAGE_MODULE_VERSION="${STORAGE_MODULE_VERSION}")
+    STORAGE_MODULE_VERSION="${STORAGE_MODULE_VERSION}"
+    STORAGE_MODULE_TEST_CANCEL_WAIT_TIMEOUT_MS=50)
 
 # Integration tests (real libstorage)
 

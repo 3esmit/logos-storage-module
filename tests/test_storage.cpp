@@ -625,6 +625,37 @@ LOGOS_TEST(downloadToUrlV2_rejects_embedded_nuls_before_c_api_dispatch) {
     delete impl;
 }
 
+LOGOS_TEST(versioned_download_rejects_malformed_operation_ids) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+    const std::string operationIdWithNul =
+        std::string("download-operation") + '\0' + "other";
+
+    const StdLogosResult startNulResult = impl->downloadToUrlV2(
+        "QmOperationIdValidation", "/tmp/versioned-operation-id", false, 64,
+        operationIdWithNul, 64);
+    const StdLogosResult startWhitespaceResult = impl->downloadToUrlV2(
+        "QmOperationIdValidation", "/tmp/versioned-operation-id", false, 64,
+        "download operation", 64);
+    const StdLogosResult cancelNulResult = impl->downloadCancelV2(operationIdWithNul);
+    const StdLogosResult cancelWhitespaceResult =
+        impl->downloadCancelV2("download operation");
+
+    LOGOS_ASSERT_FALSE(startNulResult.success);
+    LOGOS_ASSERT_FALSE(startWhitespaceResult.success);
+    LOGOS_ASSERT_FALSE(cancelNulResult.success);
+    LOGOS_ASSERT_FALSE(cancelWhitespaceResult.success);
+    LOGOS_ASSERT_EQ(cancelNulResult.error, std::string("Invalid download operation ID."));
+    LOGOS_ASSERT_EQ(cancelWhitespaceResult.error,
+                    std::string("Invalid download operation ID."));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_manifest"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_init"));
+    LOGOS_ASSERT_FALSE(t.cFunctionCalled("storage_download_cancel"));
+
+    impl->destroy();
+    delete impl;
+}
+
 LOGOS_TEST(legacy_download_rejects_embedded_nuls_before_c_api_dispatch) {
     auto t = LogosTestContext("storage_module");
     auto* impl = createInitializedImpl(t);

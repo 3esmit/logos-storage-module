@@ -175,6 +175,11 @@ static bool containsEmbeddedNul(const std::string& value) {
     return value.find('\0') != std::string::npos;
 }
 
+static bool isValidDownloadV2OperationId(const std::string& operationId) {
+    return !operationId.empty() && !containsEmbeddedNul(operationId)
+        && operationId.find_first_of(" \t\r\n") == std::string::npos;
+}
+
 static bool manifestDatasetSize(const std::string& message, uint64_t& size) {
     try {
         const json manifest = json::parse(message);
@@ -1654,10 +1659,9 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
     if (!storageCtx) {
         return {false, {}, "Storage context not initialized."};
     }
-    if (cid.empty() || filePath.empty() || operationId.empty()
+    if (cid.empty() || filePath.empty() || !isValidDownloadV2OperationId(operationId)
         || containsEmbeddedNul(cid) || containsEmbeddedNul(filePath)
-        || containsEmbeddedNul(operationId)
-        || operationId.find_first_of(" \t\r\n") != std::string::npos || operationId == cid
+        || operationId == cid
         || chunkSize <= 0 || maxDownloadBytes <= 0
         || maxDownloadBytes > MAX_DOWNLOAD_V2_BYTES
         || chunkSize > MAX_DOWNLOAD_V2_CHUNK_BYTES) {
@@ -1778,6 +1782,9 @@ StdLogosResult StorageModuleImpl::downloadCancelV2(const std::string& operationI
     reapFinishedDownloadV2Workers();
     if (operationId.empty()) {
         return {false, {}, "Download operation ID is required."};
+    }
+    if (!isValidDownloadV2OperationId(operationId)) {
+        return {false, {}, "Invalid download operation ID."};
     }
 
     std::string cid;

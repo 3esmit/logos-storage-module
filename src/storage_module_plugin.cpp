@@ -271,7 +271,7 @@ static bool replaceDownloadV2Destination(const fs::path& stagingPath,
     std::error_code backupError;
     fs::rename(destinationPath, backupPath, backupError);
     if (backupError) {
-        error = "Failed to replace download destination: " + renameError.message();
+        error = "Failed to replace download destination: " + backupError.message();
         return false;
     }
 

@@ -37,15 +37,29 @@
           pkgs = import nixpkgs { inherit system; };
           unitTests = testsPackage system;
           runner = pkgs.writeShellScript "run-tests" ''
+            set -u
             filter="''${1:-}"
             ran=0
             for bin in ${unitTests}/bin/*; do
               name="$(basename "$bin")"
-              if [ -n "$filter" ] && ! echo "$name" | grep -q "$filter"; then
+              if [ -n "$filter" ] && ! printf '%s\n' "$name" | ${pkgs.gnugrep}/bin/grep -q -- "$filter"; then
                 continue
               fi
               echo "=== $name ==="
-              "$bin"
+              output="$(mktemp)"
+              if ! "$bin" --json >"$output" 2>&1; then
+                cat "$output"
+                rm -f "$output"
+                exit 1
+              fi
+              cat "$output"
+              summary="$(tail -n 1 "$output")"
+              rm -f "$output"
+              if ! printf '%s\n' "$summary" | ${pkgs.jq}/bin/jq -e \
+                  '(.failed | type) == "number" and .failed == 0' >/dev/null; then
+                echo "Test binary reported failures or no JSON summary: $name" >&2
+                exit 1
+              fi
               ran=$((ran + 1))
             done
             if [ "$ran" -eq 0 ] && [ -n "$filter" ]; then

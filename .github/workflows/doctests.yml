@@ -72,34 +72,58 @@ jobs:
       # commit. Passed to --release-for below so the doc-test packages THIS commit
       # of logos-storage-module instead of the latest published flake.
       #
-      # Fork PRs are the exception: their head commit lives in the fork, not in
-      # logos-co/logos-storage-module, so nix could not fetch
-      # `github:logos-co/logos-storage-module/<sha>`. We blank the SHA for forks
-      # (--release-for repo= → pins that repo to latest), so the doc-test still
-      # runs for fork PRs, just against master.
+      # External PRs are the exception: their head commit lives in another
+      # repository, so this workflow cannot fetch it through this repository's
+      # flake URL. A branch in this repository remains testable even when this
+      # repository itself is a fork, so compare the two repository names rather
+      # than the head repository's own `fork` flag.
       - name: Resolve commit under test
         id: commit
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ] && \
-             [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+             [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
             echo "sha=" >> "$GITHUB_OUTPUT"
-            echo "Fork PR detected — doc-test will run against latest master."
+            echo "External PR detected — doc-test will run against this repository's latest master."
           else
             echo "sha=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
           fi
+
+      # The checked-in specs name the canonical repository so they remain useful
+      # outside CI. At runtime, substitute the repository hosting this workflow:
+      # that lets a same-repository branch in a fork resolve its actual head SHA,
+      # while an external PR continues to exercise this repository's master.
+      - name: Point doc-tests at this repository
+        env:
+          STORAGE_MODULE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          canonical = "github:logos-co/logos-storage-module{release}"
+          repository = os.environ["STORAGE_MODULE_REPOSITORY"]
+          replacement = f"github:{repository}{{release}}"
+
+          for spec in Path("doctests").glob("*.test.yaml"):
+              content = spec.read_text()
+              updated = content.replace(canonical, replacement)
+              if updated != content:
+                  spec.write_text(updated)
+          PY
 
       # The runner is the shared `doctest` CLI, invoked directly via its flake
       # (github:logos-co/logos-doctest). The flake bundles Python + PyYAML
       # (+ rich), so no pip install step is needed.
       #
       # --release-for pins the {release} placeholder for logos-storage-module to
-      # the commit under test, so `github:logos-co/logos-storage-module{release}`
-      # in the spec becomes `.../<sha>` — the doc-test packages and exercises this
-      # PR/push rather than master. Every other repo URL still resolves to latest.
+      # the commit under test. The preceding step maps the canonical source URL
+      # to this repository, so same-repository PRs package and exercise their
+      # actual head commit. Every other repo URL still resolves to latest.
       - name: Run storage-module doc-tests
         run: |
-          # Both specs run in one invocation so they share a single --report.
+          # All specs run in one invocation so they share a single --report.
           # --continue-on-fail so the run walks every step and the published
           # report is complete. The job still fails (non-zero exit) if any step
           # failed; this only changes whether we stop early.

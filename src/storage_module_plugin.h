@@ -3,8 +3,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <logos_json.h>
 #include <logos_module_context.h>
@@ -13,6 +18,9 @@
 extern "C" {
 #include "lib/libstorage.h"
 }
+
+struct DownloadV2State;
+struct DownloadRegistry;
 
 /// Logos Storage Module API.
 ///
@@ -268,7 +276,7 @@ public:
     /// `cid`       – content identifier to download.
     /// `filePath`  – destination path on disk.
     /// `local`     – if true, only reads from locally cached data (no network).
-    /// `chunkSize` – download chunk size in bytes (default 65536).
+    /// `chunkSize` – download chunk size in bytes (default 65536, maximum 1048576).
     ///
     /// Returns StdLogosResult::value as the session ID (= CID) on success.
     ///
@@ -285,7 +293,7 @@ public:
     ///
     /// `cid`       – content identifier to download.
     /// `local`     – if true, only reads from locally cached data (no network).
-    /// `chunkSize` – download chunk size in bytes (default 65536).
+    /// `chunkSize` – download chunk size in bytes (default 65536, maximum 1048576).
     ///
     /// Returns StdLogosResult::value as the session ID (= CID) on success.
     ///
@@ -299,6 +307,68 @@ public:
     /// Returns StdLogosResult::success = true on success.
     /// The method is synchronous.
     StdLogosResult downloadCancel(const std::string& sessionId);
+
+    /// Describe the versioned, caller-correlated download protocol.
+    ///
+    /// The returned map has these fields:
+    /// @code{.json}
+    /// {
+    ///   "protocol": "logos.storage.download",
+    ///   "version": 2,
+    ///   "moduleOperationIdOwner": "caller",
+    ///   "cancelTimeoutMs": 15000,
+    ///   "maxDownloadBytes": 1073741824,
+    ///   "maxChunkBytes": 1048576
+    /// }
+    /// @endcode
+    ///
+    /// Callers must create a unique operation ID and use it to match the
+    /// acknowledgement, terminal event, and cancellation response.
+    /// The method is synchronous and does not require a running node.
+    LogosMap downloadProtocol();
+
+    /// Start a caller-correlated file download.
+    ///
+    /// `operationId` must be a unique, non-empty caller-generated value, must
+    /// not equal `cid`, and must not contain a space, tab, carriage return, or
+    /// newline. `maxDownloadBytes` must be positive and no larger than the
+    /// limit advertised by downloadProtocol(). `chunkSize` must be positive and
+    /// no larger than `maxChunkBytes`; it is capped to `maxDownloadBytes` before
+    /// native initialization. The manifest is checked before the download
+    /// starts; oversized content is rejected before dispatch.
+    /// Content is written to a sibling staging file and replaces `filePath` only
+    /// after a successful terminal result. Failed or canceled downloads preserve
+    /// a pre-existing destination file.
+    ///
+    /// Returns an acknowledgement map on success:
+    /// @code{.json}
+    /// {
+    ///   "protocol": "logos.storage.download",
+    ///   "version": 2,
+    ///   "accepted": true,
+    ///   "moduleOperationId": string,
+    ///   "cid": string
+    /// }
+    /// @endcode
+    ///
+    /// Completion is reported only through storageDownloadDoneV2().
+    StdLogosResult downloadToUrlV2(const std::string& cid,
+                                   const std::string& filePath,
+                                   bool local,
+                                   int chunkSize,
+                                   const std::string& operationId,
+                                   int maxDownloadBytes);
+
+    /// Request cancellation of a versioned download by caller operation ID.
+    ///
+    /// The response identifies the operation and one of `canceled`,
+    /// `already_terminal`, or `not_found`. An `already_terminal` response also
+    /// includes its `terminalOutcome`. A `canceled` response acknowledges the
+    /// cancellation request; storageDownloadDoneV2() remains authoritative for
+    /// the terminal outcome. Invalid arguments and cancellation dispatch
+    /// failures return an unsuccessful StdLogosResult instead of a
+    /// cancellation-status map.
+    StdLogosResult downloadCancelV2(const std::string& operationId);
 
     /// Check whether content identified by CID exists in local storage.
     ///
@@ -446,6 +516,19 @@ logos_events:
     /// @endcode
     void storageDownloadDone(const std::string& payload);
 
+    /// Emitted when a downloadToUrlV2() operation reaches a terminal state.
+    /// @code{.json}
+    /// {
+    ///   "protocol": "logos.storage.download",
+    ///   "version": 2,
+    ///   "moduleOperationId": string,
+    ///   "cid": string,
+    ///   "outcome": "succeeded" | "failed" | "canceled",
+    ///   "error": string // present only for failed operations
+    /// }
+    /// @endcode
+    void storageDownloadDoneV2(const std::string& payload);
+
     /// Emitted when downloadManifest() finishes.
     /// @code{.json}
     /// {
@@ -476,7 +559,27 @@ logos_events:
     /// @}
 
 private:
+    struct DownloadV2Worker {
+        std::shared_ptr<DownloadV2State> state;
+        std::thread thread;
+    };
+
     void* storageCtx;
+
+    std::shared_ptr<DownloadRegistry> downloadRegistry;
+    std::mutex downloadV2WorkersMutex;
+    std::vector<DownloadV2Worker> downloadV2Workers;
+
+    void runDownloadV2(const std::shared_ptr<DownloadV2State>& state,
+                       const std::string& stagingPath,
+                       const std::string& destinationPath, int chunkSize,
+                       uint64_t expectedBytes, uint64_t maxBytes);
+    void finishDownloadV2(const std::shared_ptr<DownloadV2State>& state,
+                          const std::string& outcome,
+                          const std::string& error = {},
+                          bool releaseLease = true);
+    void reapFinishedDownloadV2Workers();
+    void cancelAndJoinDownloadV2Workers();
 
     /// Shared internal download helper used by downloadToUrl and downloadChunks.
     /// Returns session ID (= cid) on success, empty string on failure.

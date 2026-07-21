@@ -8,9 +8,13 @@
 //   t.mockCFunction("storage_peer_id").returns("QmTestPeerId");
 
 #include <logos_clib_mock.h>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <condition_variable>
+#include <mutex>
+#include <string>
 
 #define RET_OK 0
 #define RET_ERR 1
@@ -21,11 +25,200 @@ typedef void (*StorageCallback)(int callerRet, const char *msg, size_t len, void
 // Sentinel address used as a fake non-null storage context.
 static char s_fakeCtx = 0;
 
+static std::mutex s_downloadChunkMutex;
+static std::condition_variable s_downloadChunkReady;
+static bool s_holdNextDownloadChunk = false;
+static StorageCallback s_heldDownloadChunkCallback = nullptr;
+static void* s_heldDownloadChunkUserData = nullptr;
+static std::string s_nextDownloadChunkPayload;
+
+static std::mutex s_downloadInitMutex;
+static std::condition_variable s_downloadInitReady;
+static bool s_holdNextDownloadInit = false;
+static StorageCallback s_heldDownloadInitCallback = nullptr;
+static void* s_heldDownloadInitUserData = nullptr;
+static std::string s_heldDownloadInitCid;
+static bool s_heldDownloadInitSessionOpen = false;
+
+static std::mutex s_downloadCancelMutex;
+static std::condition_variable s_downloadCancelReady;
+static bool s_downloadCancelObserved = false;
+static bool s_holdNextDownloadCancel = false;
+static StorageCallback s_heldDownloadCancelCallback = nullptr;
+static void* s_heldDownloadCancelUserData = nullptr;
+static std::string s_heldDownloadCancelCid;
+
+static std::mutex s_downloadStreamMutex;
+static std::condition_variable s_downloadStreamReady;
+static bool s_holdNextDownloadStream = false;
+static StorageCallback s_heldDownloadStreamCallback = nullptr;
+static void* s_heldDownloadStreamUserData = nullptr;
+
+void mockStorageSetNextDownloadChunkPayload(const char* payload) {
+    std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+    s_nextDownloadChunkPayload = payload ? payload : "";
+}
+
+void mockStorageHoldNextDownloadChunk() {
+    std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+    s_holdNextDownloadChunk = true;
+}
+
+bool mockStorageWaitForHeldDownloadChunk(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(s_downloadChunkMutex);
+    return s_downloadChunkReady.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [] {
+            return s_heldDownloadChunkCallback != nullptr;
+        });
+}
+
+void mockStorageCompleteHeldDownloadChunk(int result, const char* payload,
+                                          const char* message) {
+    StorageCallback callback = nullptr;
+    void* userData = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+        callback = s_heldDownloadChunkCallback;
+        userData = s_heldDownloadChunkUserData;
+        s_heldDownloadChunkCallback = nullptr;
+        s_heldDownloadChunkUserData = nullptr;
+    }
+    if (!callback) return;
+    if (payload && *payload) {
+        callback(RET_PROGRESS, payload, strlen(payload), userData);
+    }
+    const char* terminal = message ? message : "";
+    callback(result, terminal, strlen(terminal), userData);
+}
+
+void mockStorageHoldNextDownloadInit() {
+    std::lock_guard<std::mutex> lock(s_downloadInitMutex);
+    s_holdNextDownloadInit = true;
+    s_heldDownloadInitSessionOpen = false;
+    s_heldDownloadInitCid.clear();
+}
+
+bool mockStorageWaitForHeldDownloadInit(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(s_downloadInitMutex);
+    return s_downloadInitReady.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [] {
+            return s_heldDownloadInitCallback != nullptr;
+        });
+}
+
+void mockStorageCompleteHeldDownloadInit(int result, const char* message) {
+    StorageCallback callback = nullptr;
+    void* userData = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s_downloadInitMutex);
+        callback = s_heldDownloadInitCallback;
+        userData = s_heldDownloadInitUserData;
+        s_heldDownloadInitCallback = nullptr;
+        s_heldDownloadInitUserData = nullptr;
+        if (result == RET_OK) s_heldDownloadInitSessionOpen = true;
+    }
+    if (!callback) return;
+    const char* terminal = message ? message : "";
+    callback(result, terminal, strlen(terminal), userData);
+}
+
+bool mockStorageHeldDownloadInitSessionOpen() {
+    std::lock_guard<std::mutex> lock(s_downloadInitMutex);
+    return s_heldDownloadInitSessionOpen;
+}
+
+void mockStorageResetDownloadCancelObservation() {
+    std::lock_guard<std::mutex> lock(s_downloadCancelMutex);
+    s_downloadCancelObserved = false;
+}
+
+bool mockStorageWaitForDownloadCancel(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(s_downloadCancelMutex);
+    return s_downloadCancelReady.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [] {
+            return s_downloadCancelObserved;
+        });
+}
+
+void mockStorageHoldNextDownloadCancel() {
+    std::lock_guard<std::mutex> lock(s_downloadCancelMutex);
+    s_holdNextDownloadCancel = true;
+    s_heldDownloadCancelCallback = nullptr;
+    s_heldDownloadCancelUserData = nullptr;
+    s_heldDownloadCancelCid.clear();
+}
+
+bool mockStorageWaitForHeldDownloadCancel(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(s_downloadCancelMutex);
+    return s_downloadCancelReady.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [] {
+            return s_heldDownloadCancelCallback != nullptr;
+        });
+}
+
+void mockStorageCompleteHeldDownloadCancel(int result, const char* message) {
+    StorageCallback callback = nullptr;
+    void* userData = nullptr;
+    std::string cid;
+    {
+        std::lock_guard<std::mutex> lock(s_downloadCancelMutex);
+        callback = s_heldDownloadCancelCallback;
+        userData = s_heldDownloadCancelUserData;
+        cid = s_heldDownloadCancelCid;
+        s_heldDownloadCancelCallback = nullptr;
+        s_heldDownloadCancelUserData = nullptr;
+        s_heldDownloadCancelCid.clear();
+    }
+    if (!callback) return;
+    if (result == RET_OK) {
+        std::lock_guard<std::mutex> lock(s_downloadInitMutex);
+        if (s_heldDownloadInitSessionOpen && s_heldDownloadInitCid == cid) {
+            s_heldDownloadInitSessionOpen = false;
+        }
+    }
+    const char* terminal = message ? message : "";
+    callback(result, terminal, strlen(terminal), userData);
+}
+
+void mockStorageHoldNextDownloadStream() {
+    std::lock_guard<std::mutex> lock(s_downloadStreamMutex);
+    s_holdNextDownloadStream = true;
+}
+
+bool mockStorageWaitForHeldDownloadStream(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(s_downloadStreamMutex);
+    return s_downloadStreamReady.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [] {
+            return s_heldDownloadStreamCallback != nullptr;
+        });
+}
+
+void mockStorageCompleteHeldDownloadStream(int result, const char* message) {
+    StorageCallback callback = nullptr;
+    void* userData = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s_downloadStreamMutex);
+        callback = s_heldDownloadStreamCallback;
+        userData = s_heldDownloadStreamUserData;
+        s_heldDownloadStreamCallback = nullptr;
+        s_heldDownloadStreamUserData = nullptr;
+    }
+    if (!callback) return;
+    const char* terminal = message ? message : "";
+    callback(result, terminal, strlen(terminal), userData);
+}
+
 // Helper: invoke callback with RET_OK and the string from the mock store.
 static void invokeOk(const char* funcName, StorageCallback cb, void* userData) {
     if (!cb) return;
     const char* msg = LogosCMockStore::instance().getReturnString(funcName);
     cb(RET_OK, msg ? msg : "", msg ? strlen(msg) : 0, userData);
+}
+
+static void invokeError(StorageCallback cb, void* userData, const char* message) {
+    if (!cb) return;
+    const char* error = message ? message : "forced mock error";
+    cb(RET_ERR, error, strlen(error), userData);
 }
 
 extern "C" {
@@ -156,6 +349,33 @@ int storage_upload_cancel(void* ctx, const char* sessionId, StorageCallback cb, 
 
 int storage_download_cancel(void* ctx, const char* cid, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_download_cancel");
+    {
+        std::lock_guard<std::mutex> lock(s_downloadCancelMutex);
+        s_downloadCancelObserved = true;
+    }
+    s_downloadCancelReady.notify_all();
+    const int rc = LOGOS_CMOCK_RETURN(int, "storage_download_cancel");
+    if (rc != RET_OK) {
+        invokeError(cb, userData, "forced cancel dispatch failure");
+        return rc;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_downloadCancelMutex);
+        if (s_holdNextDownloadCancel) {
+            s_holdNextDownloadCancel = false;
+            s_heldDownloadCancelCallback = cb;
+            s_heldDownloadCancelUserData = userData;
+            s_heldDownloadCancelCid = cid ? cid : "";
+            s_downloadCancelReady.notify_all();
+            return RET_OK;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_downloadInitMutex);
+        if (cid && s_heldDownloadInitSessionOpen && s_heldDownloadInitCid == cid) {
+            s_heldDownloadInitSessionOpen = false;
+        }
+    }
     invokeOk("storage_download_cancel", cb, userData);
     return RET_OK;
 }
@@ -212,6 +432,22 @@ int storage_upload_chunk(void* ctx, const char* sessionId, const uint8_t* chunk,
 int storage_download_init(void* ctx, const char* cid, size_t chunkSize, bool local,
                           StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_download_init");
+    {
+        std::lock_guard<std::mutex> lock(s_downloadInitMutex);
+        if (s_holdNextDownloadInit) {
+            s_holdNextDownloadInit = false;
+            s_heldDownloadInitCallback = cb;
+            s_heldDownloadInitUserData = userData;
+            s_heldDownloadInitCid = cid ? cid : "";
+            s_downloadInitReady.notify_all();
+            return RET_OK;
+        }
+    }
+    const int rc = LOGOS_CMOCK_RETURN(int, "storage_download_init");
+    if (rc != RET_OK) {
+        invokeError(cb, userData, "forced init dispatch failure");
+        return rc;
+    }
     invokeOk("storage_download_init", cb, userData);
     return RET_OK;
 }
@@ -219,10 +455,49 @@ int storage_download_init(void* ctx, const char* cid, size_t chunkSize, bool loc
 int storage_download_stream(void* ctx, const char* cid, size_t chunkSize, bool local,
                             const char* filepath, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_download_stream");
-    // Unset return defaults to RET_OK; on a forced failure the callback never fires.
-    int rc = LOGOS_CMOCK_RETURN(int, "storage_download_stream");
-    if (rc == RET_OK) invokeOk("storage_download_stream", cb, userData);
+    {
+        std::lock_guard<std::mutex> lock(s_downloadStreamMutex);
+        if (s_holdNextDownloadStream) {
+            s_holdNextDownloadStream = false;
+            s_heldDownloadStreamCallback = cb;
+            s_heldDownloadStreamUserData = userData;
+            s_downloadStreamReady.notify_all();
+            return RET_OK;
+        }
+    }
+    const int rc = LOGOS_CMOCK_RETURN(int, "storage_download_stream");
+    if (rc != RET_OK) {
+        invokeError(cb, userData, "forced stream dispatch failure");
+        return rc;
+    }
+    invokeOk("storage_download_stream", cb, userData);
     return rc;
+}
+
+int storage_download_chunk(void* ctx, const char* cid, StorageCallback cb,
+                           void* userData) {
+    LOGOS_CMOCK_RECORD("storage_download_chunk");
+    std::string payload;
+    {
+        std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
+        if (s_holdNextDownloadChunk) {
+            s_holdNextDownloadChunk = false;
+            s_heldDownloadChunkCallback = cb;
+            s_heldDownloadChunkUserData = userData;
+            s_downloadChunkReady.notify_all();
+            return RET_OK;
+        }
+        payload = std::move(s_nextDownloadChunkPayload);
+        s_nextDownloadChunkPayload.clear();
+    }
+
+    const int rc = LOGOS_CMOCK_RETURN(int, "storage_download_chunk");
+    if (rc != RET_OK) return rc;
+    if (cb && !payload.empty()) {
+        cb(RET_PROGRESS, payload.data(), payload.size(), userData);
+    }
+    if (cb) cb(RET_OK, "", 0, userData);
+    return RET_OK;
 }
 
 } // extern "C"

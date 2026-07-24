@@ -6,7 +6,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 workflow=".github/workflows/release.yml"
-action_ref="3esmit/logos-modules-release-action/.github/workflows/release.yml@7e09ddf90bf33ce29ef3505609332175a6cd06c9"
+action_ref="3esmit/logos-modules-release-action/.github/workflows/release.yml@81f506530c56e8757e6d99ee7f9d4c092e74411c"
 
 assert_workflow_line() {
   local expected="$1"

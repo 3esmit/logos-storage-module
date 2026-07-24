@@ -1,0 +1,45 @@
+name: Publish Storage Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Rebuild and replace an existing package release for this version."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Validate source release contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate default branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/master"
+
+      - name: Validate release contract
+        run: ./scripts/test-source-release-workflow.sh
+
+  release:
+    needs: preflight
+    permissions:
+      contents: write
+    uses: 3esmit/logos-modules-release-action/.github/workflows/release.yml@670e3d8b704207da88947d3417767fa34a9c5e28
+    with:
+      module_path: .
+      metadata_path: metadata.json
+      build_attr: lgx-portable
+      variants: linux-amd64,darwin-arm64
+      require_all_variants: true
+      dispatch_rebuild_index: false
+      prerelease: true
+      signing_mode: none
+      skip_if_published: ${{ !inputs.force_build }}

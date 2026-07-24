@@ -70,6 +70,20 @@ nix build .#tests
 ./result/bin/storage_module_integration_tests
 ```
 
+## Package Releases
+
+This repository owns Storage Module package releases. Maintainers run the
+**Publish Storage Module** workflow from `master`; it reads the package name
+and version from `metadata.json`, requires both `linux-amd64` and
+`darwin-arm64` portable variants, and publishes them as a prerelease tagged
+`storage_module-v<version>`.
+
+Each release contains `storage_module-<version>.lgx` and `sidecar.json`.
+Complete releases are skipped by default; the workflow's `force_build` input
+rebuilds and replaces the assets for the same version. Releases are currently
+unsigned. External catalogs may index these source-owned assets, but this
+workflow does not dispatch or publish a catalog index.
+
 ### Logoscore
 
 To run Logoscore, see [`docs/logoscore-overview/logoscore.md`](docs/logoscore-overview/logoscore.md).

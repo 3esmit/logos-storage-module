@@ -11,6 +11,7 @@
 
 using logos_test::recordEvent;
 
+void StorageModuleImpl::nodeChanged(const std::string& payload)             { recordEvent("nodeChanged", payload); }
 void StorageModuleImpl::storageStart(const std::string& payload)            { recordEvent("storageStart", payload); }
 void StorageModuleImpl::storageStop(const std::string& payload)             { recordEvent("storageStop", payload); }
 void StorageModuleImpl::storageConnect(const std::string& payload)          { recordEvent("storageConnect", payload); }

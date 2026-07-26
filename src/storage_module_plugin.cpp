@@ -172,20 +172,112 @@ static std::string fromMsg(const char* msg, size_t len) {
 }
 
 static constexpr std::uint8_t STORAGE_LIFECYCLE_NOT_INITIALIZED = 0;
-static constexpr std::uint8_t STORAGE_LIFECYCLE_STOPPED = 1;
-static constexpr std::uint8_t STORAGE_LIFECYCLE_STARTING = 2;
-static constexpr std::uint8_t STORAGE_LIFECYCLE_RUNNING = 3;
-static constexpr std::uint8_t STORAGE_LIFECYCLE_STOPPING = 4;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_INITIALIZING = 1;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_STOPPED = 2;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_STARTING = 3;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_RUNNING = 4;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_STOPPING = 5;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_DESTROYING = 6;
+static constexpr std::size_t MAX_NODE_LIFECYCLE_REQUEST_BYTES = 65536;
+static constexpr std::size_t MAX_NODE_LIFECYCLE_CONFIG_BYTES = 49152;
+static constexpr std::size_t MAX_NODE_LIFECYCLE_OPERATION_ID_BYTES = 128;
+static constexpr std::size_t MAX_COMPLETED_NODE_LIFECYCLE_OPERATIONS = 128;
+static constexpr const char* NODE_LIFECYCLE_SNAPSHOT_SCHEMA =
+    "logos.managed_node_lifecycle.snapshot";
+static constexpr const char* NODE_LIFECYCLE_COMMAND_SCHEMA =
+    "logos.managed_node_lifecycle.command";
+static constexpr const char* NODE_LIFECYCLE_ACK_SCHEMA =
+    "logos.managed_node_lifecycle.ack";
+static constexpr const char* NODE_LIFECYCLE_EVENT_SCHEMA =
+    "logos.managed_node_lifecycle.event";
+static std::atomic<std::uint64_t> nextNodeLifecycleInstanceSerial{0};
 
 static const char* storageLifecycleStateName(std::uint8_t state) {
     switch (state) {
     case STORAGE_LIFECYCLE_NOT_INITIALIZED: return "not_initialized";
+    case STORAGE_LIFECYCLE_INITIALIZING: return "not_initialized";
     case STORAGE_LIFECYCLE_STOPPED: return "stopped";
     case STORAGE_LIFECYCLE_STARTING: return "starting";
     case STORAGE_LIFECYCLE_RUNNING: return "running";
     case STORAGE_LIFECYCLE_STOPPING: return "stopping";
+    case STORAGE_LIFECYCLE_DESTROYING: return "stopped";
     default: return "unknown";
     }
+}
+
+static const char* nodeLifecycleStateName(std::uint8_t state) {
+    switch (state) {
+    case STORAGE_LIFECYCLE_NOT_INITIALIZED: return "uninitialized";
+    case STORAGE_LIFECYCLE_INITIALIZING: return "initializing";
+    case STORAGE_LIFECYCLE_STOPPED: return "stopped";
+    case STORAGE_LIFECYCLE_STARTING: return "starting";
+    case STORAGE_LIFECYCLE_RUNNING: return "running";
+    case STORAGE_LIFECYCLE_STOPPING: return "stopping";
+    case STORAGE_LIFECYCLE_DESTROYING: return "destroying";
+    default: return "uninitialized";
+    }
+}
+
+static int64_t nodeLifecycleTimestampMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string makeNodeLifecycleInstanceId() {
+    const auto serial = nextNodeLifecycleInstanceSerial.fetch_add(1) + 1;
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return "storage-" + std::to_string(now) + "-" + std::to_string(serial);
+}
+
+static bool isValidNodeLifecycleOperationId(const std::string& operationId) {
+    if (operationId.empty()
+        || operationId.size() > MAX_NODE_LIFECYCLE_OPERATION_ID_BYTES) {
+        return false;
+    }
+    return std::all_of(operationId.begin(), operationId.end(), [](unsigned char c) {
+        return c >= 0x21 && c <= 0x7e;
+    });
+}
+
+static std::vector<std::string> nodeLifecycleActions(std::uint8_t state) {
+    switch (state) {
+    case STORAGE_LIFECYCLE_NOT_INITIALIZED:
+        return {"initialize"};
+    case STORAGE_LIFECYCLE_STOPPED:
+        return {"start", "destroy"};
+    case STORAGE_LIFECYCLE_STARTING:
+    case STORAGE_LIFECYCLE_RUNNING:
+        return {"stop"};
+    default:
+        return {};
+    }
+}
+
+static const char* lifecycleFailureMessage(const std::string& action) {
+    if (action == "initialize") return "Storage initialization failed.";
+    if (action == "start") return "Storage start failed.";
+    if (action == "stop") return "Storage stop failed.";
+    if (action == "destroy") return "Storage destruction failed.";
+    return "Storage lifecycle action failed.";
+}
+
+static const char* lifecycleFailureCode(const std::string& action) {
+    if (action == "initialize") return "initialize_failed";
+    if (action == "start") return "start_failed";
+    if (action == "stop") return "stop_failed";
+    if (action == "destroy") return "destroy_failed";
+    return "lifecycle_action_failed";
+}
+
+static json nodeLifecycleError(const std::string& code,
+                               const std::string& message,
+                               std::int64_t occurredAtMs) {
+    return {
+        {"code", code},
+        {"message", message},
+        {"occurred_at_ms", occurredAtMs},
+    };
 }
 
 static bool containsEmbeddedNul(const std::string& value) {
@@ -593,27 +685,33 @@ static void emitSessionResult(StorageModuleImpl* impl, StorageEvent emit,
 struct SimpleEventCtx : AsyncCallbackBase {
     StorageModuleImpl* impl;
     StorageEvent event;
-    std::atomic<std::uint8_t>* lifecycleState;
     std::atomic<std::uint64_t>* lifecycleGeneration;
     std::uint64_t generation;
+    std::string lifecycleAction;
+    std::string operationId;
+    std::uint8_t previousState;
     std::uint8_t successState;
     std::uint8_t failureState;
 
     SimpleEventCtx(StorageModuleImpl* i, StorageEvent ev,
-                   std::atomic<std::uint8_t>* state = nullptr,
                    std::atomic<std::uint64_t>* generationCounter = nullptr,
                    std::uint64_t operationGeneration = 0,
+                   std::string action = {}, std::string operation = {},
+                   std::uint8_t priorState = STORAGE_LIFECYCLE_NOT_INITIALIZED,
                    std::uint8_t completedState = STORAGE_LIFECYCLE_NOT_INITIALIZED,
                    std::uint8_t failedState = STORAGE_LIFECYCLE_NOT_INITIALIZED)
-        : impl(i), event(ev), lifecycleState(state),
-          lifecycleGeneration(generationCounter), generation(operationGeneration),
+        : impl(i), event(ev), lifecycleGeneration(generationCounter),
+          generation(operationGeneration), lifecycleAction(std::move(action)),
+          operationId(std::move(operation)), previousState(priorState),
           successState(completedState), failureState(failedState) {}
 
     void handleResponse(int ret, const char* msg, size_t len) override {
-        if (lifecycleState && lifecycleGeneration
+        if (impl && lifecycleGeneration
             && lifecycleGeneration->load() == generation) {
-            lifecycleState->store(
-                ret == RET_OK ? successState : failureState);
+            impl->settleLifecycleAction(lifecycleAction, operationId,
+                                        generation, previousState,
+                                        successState, failureState,
+                                        ret == RET_OK);
         }
         emitBasicResponse(impl, event, ret, fromMsg(msg, len), "SimpleEventCtx");
     }
@@ -1321,7 +1419,9 @@ static LegacyDownloadInitResult startLegacyDownloadInit(
 
 StorageModuleImpl::StorageModuleImpl()
     : storageCtx(nullptr), lifecycleState(STORAGE_LIFECYCLE_NOT_INITIALIZED),
-      lifecycleGeneration(0), downloadRegistry(std::make_shared<DownloadRegistry>()) {
+      lifecycleGeneration(0), lifecycleInstanceId(makeNodeLifecycleInstanceId()),
+      lifecycleUpdatedAtMs(nodeLifecycleTimestampMs()),
+      downloadRegistry(std::make_shared<DownloadRegistry>()) {
     fprintf(stderr, "StorageModuleImpl: Initializing...\n");
 }
 
@@ -1341,28 +1441,436 @@ StorageModuleImpl::~StorageModuleImpl() {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+std::string StorageModuleImpl::lifecycleSnapshotLocked() const {
+    const std::uint8_t state = lifecycleState.load();
+    json snapshot;
+    snapshot["schema"] = NODE_LIFECYCLE_SNAPSHOT_SCHEMA;
+    snapshot["version"] = 1;
+    snapshot["instance_id"] = lifecycleInstanceId;
+    snapshot["epoch"] = lifecycleEpoch;
+    snapshot["sequence"] = lifecycleSequence;
+    snapshot["scope"] = {{"kind", "storage"}};
+    snapshot["state"] = nodeLifecycleStateName(state);
+    snapshot["health"] = lifecycleError.empty() ? "unknown" : "degraded";
+    snapshot["supported_actions"] = nodeLifecycleActions(state);
+    snapshot["pending_operation"] = nullptr;
+    if (!activeLifecycleOperationId.empty()) {
+        const auto pending = lifecycleOperations.find(activeLifecycleOperationId);
+        if (pending != lifecycleOperations.end() && !pending->second.settled) {
+            snapshot["pending_operation"] = {
+                {"operation_id", activeLifecycleOperationId},
+                {"action", pending->second.action},
+            };
+        }
+    }
+    snapshot["last_completed_operation"] = nullptr;
+    if (!completedLifecycleOperationIds.empty()) {
+        const auto completed = lifecycleOperations.find(
+            completedLifecycleOperationIds.back());
+        if (completed != lifecycleOperations.end() && completed->second.settled) {
+            snapshot["last_completed_operation"] = {
+                {"operation_id", completedLifecycleOperationIds.back()},
+                {"action", completed->second.action},
+                {"outcome", completed->second.outcome},
+            };
+        }
+    }
+    snapshot["last_error"] = lifecycleError.empty()
+        ? json(nullptr)
+        : nodeLifecycleError(lifecycleErrorCode, lifecycleError, lifecycleErrorAtMs);
+    snapshot["updated_at_ms"] = lifecycleUpdatedAtMs;
+    return snapshot.dump();
+}
+
+std::string StorageModuleImpl::lifecycleEventLocked(const std::string& action,
+                                                     const std::string& operationId,
+                                                     const std::string& phase,
+                                                     const std::string& outcome,
+                                                     std::uint8_t previousState,
+                                                     const std::string& errorCode,
+                                                     const std::string& errorMessage) const {
+    json event;
+    event["schema"] = NODE_LIFECYCLE_EVENT_SCHEMA;
+    event["version"] = 1;
+    event["instance_id"] = lifecycleInstanceId;
+    event["epoch"] = lifecycleEpoch;
+    event["sequence"] = lifecycleSequence;
+    event["scope"] = {{"kind", "storage"}};
+    event["operation_id"] = operationId.empty() ? json(nullptr) : json(operationId);
+    event["action"] = action;
+    event["phase"] = phase;
+    event["outcome"] = outcome;
+    event["previous_state"] = nodeLifecycleStateName(previousState);
+    event["status"] = json::parse(lifecycleSnapshotLocked());
+    event["error"] = errorCode.empty()
+        ? json(nullptr)
+        : nodeLifecycleError(errorCode, errorMessage, nodeLifecycleTimestampMs());
+    event["emitted_at_ms"] = nodeLifecycleTimestampMs();
+    return event.dump();
+}
+
+void StorageModuleImpl::emitLifecycleEvents(const std::vector<std::string>& events) {
+    for (const auto& event : events) {
+        nodeChanged(event);
+    }
+}
+
+void StorageModuleImpl::rememberCompletedLifecycleOperationLocked(
+    const std::string& operationId) {
+    if (operationId.empty()) return;
+    completedLifecycleOperationIds.push_back(operationId);
+    while (completedLifecycleOperationIds.size()
+           > MAX_COMPLETED_NODE_LIFECYCLE_OPERATIONS) {
+        const std::string expired = completedLifecycleOperationIds.front();
+        completedLifecycleOperationIds.pop_front();
+        const auto found = lifecycleOperations.find(expired);
+        if (found != lifecycleOperations.end() && found->second.settled) {
+            lifecycleOperations.erase(found);
+        }
+    }
+}
+
+StorageModuleImpl::LifecycleDispatch StorageModuleImpl::beginLifecycleAction(
+    const std::string& action, const std::string& operationId,
+    const std::string& requestFingerprint, bool hasExpectedSnapshot,
+    const std::string& expectedInstanceId, std::uint64_t expectedEpoch,
+    std::uint64_t expectedSequence, bool strictAction) {
+    LifecycleDispatch dispatch;
+    dispatch.action = action;
+    dispatch.operationId = operationId;
+
+    std::lock_guard<std::mutex> lock(lifecycleMutex);
+    const auto acknowledgement = [&](bool accepted, bool duplicate,
+                                     const std::string& errorCode,
+                                     const std::string& errorMessage) {
+        json result;
+        result["schema"] = NODE_LIFECYCLE_ACK_SCHEMA;
+        result["version"] = 1;
+        result["operation_id"] = operationId.empty() ? json(nullptr) : json(operationId);
+        result["accepted"] = accepted;
+        result["duplicate"] = duplicate;
+        result["instance_id"] = lifecycleInstanceId;
+        result["epoch"] = lifecycleEpoch;
+        result["sequence"] = lifecycleSequence;
+        result["state"] = nodeLifecycleStateName(lifecycleState.load());
+        result["error"] = errorCode.empty()
+            ? json(nullptr)
+            : nodeLifecycleError(errorCode, errorMessage, nodeLifecycleTimestampMs());
+        return result.dump();
+    };
+    const auto settleWithoutDispatch = [&](LifecycleDispatchDisposition disposition,
+                                           bool accepted,
+                                           const std::string& outcome,
+                                           const std::string& errorCode,
+                                           const std::string& errorMessage) {
+        LifecycleOperation operation;
+        operation.action = action;
+        operation.requestFingerprint = requestFingerprint;
+        operation.accepted = accepted;
+        operation.previousState = lifecycleState.load();
+        const auto inserted = lifecycleOperations.emplace(operationId, std::move(operation));
+        LifecycleOperation& stored = inserted.first->second;
+
+        if (accepted) {
+            ++lifecycleSequence;
+            lifecycleUpdatedAtMs = nodeLifecycleTimestampMs();
+            dispatch.events.push_back(lifecycleEventLocked(
+                action, operationId, "accepted", "accepted", lifecycleState.load()));
+        }
+        stored.settled = true;
+        stored.outcome = outcome;
+        rememberCompletedLifecycleOperationLocked(operationId);
+        ++lifecycleSequence;
+        lifecycleUpdatedAtMs = nodeLifecycleTimestampMs();
+        dispatch.disposition = disposition;
+        dispatch.events.push_back(lifecycleEventLocked(
+            action, operationId, "settled", outcome, lifecycleState.load(),
+            accepted ? std::string() : errorCode,
+            accepted ? std::string() : errorMessage));
+        dispatch.acknowledgement = acknowledgement(
+            accepted, false, accepted ? std::string() : errorCode,
+            accepted ? std::string() : errorMessage);
+        stored.acknowledgement = dispatch.acknowledgement;
+    };
+
+    if (strictAction) {
+        const auto existing = lifecycleOperations.find(operationId);
+        if (existing != lifecycleOperations.end()) {
+            if (existing->second.requestFingerprint != requestFingerprint) {
+                // An event with the same operation ID could be mistaken for the
+                // terminal result of the original operation, so reject only in
+                // the synchronous acknowledgement channel.
+                dispatch.disposition = LifecycleDispatchDisposition::Rejected;
+                dispatch.acknowledgement = acknowledgement(
+                    false, false, "operation_id_conflict",
+                    "operation_id was already used for a different request.");
+                return dispatch;
+            }
+            dispatch.disposition = LifecycleDispatchDisposition::Duplicate;
+            json duplicateAcknowledgement = json::parse(existing->second.acknowledgement);
+            duplicateAcknowledgement["duplicate"] = true;
+            dispatch.acknowledgement = duplicateAcknowledgement.dump();
+            return dispatch;
+        }
+        if (!activeLifecycleOperationId.empty()) {
+            const auto active = lifecycleOperations.find(activeLifecycleOperationId);
+            if (active != lifecycleOperations.end() && !active->second.settled) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Rejected, false,
+                                      "rejected", "operation_in_progress",
+                                      "A lifecycle operation is already in progress.");
+                return dispatch;
+            }
+        }
+        if (hasExpectedSnapshot
+            && (expectedInstanceId != lifecycleInstanceId
+                || expectedEpoch != lifecycleEpoch
+                || expectedSequence != lifecycleSequence)) {
+            settleWithoutDispatch(LifecycleDispatchDisposition::Rejected, false,
+                                  "rejected", "state_mismatch",
+                                  "The lifecycle snapshot is stale.");
+            return dispatch;
+        }
+    }
+
+    const std::uint8_t state = lifecycleState.load();
+    if (strictAction) {
+        if (action == "initialize") {
+            if (state != STORAGE_LIFECYCLE_NOT_INITIALIZED || storageCtx) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Rejected, false,
+                                      "rejected", "invalid_state",
+                                      "Storage is already initialized.");
+                return dispatch;
+            }
+        } else if (action == "start") {
+            if (state == STORAGE_LIFECYCLE_RUNNING) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Noop, true,
+                                      "no_op", {}, {});
+                return dispatch;
+            }
+            if (state != STORAGE_LIFECYCLE_STOPPED || !storageCtx) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Rejected, false,
+                                      "rejected", "invalid_state",
+                                      "Storage must be stopped before it can start.");
+                return dispatch;
+            }
+        } else if (action == "stop") {
+            if (state == STORAGE_LIFECYCLE_STOPPED) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Noop, true,
+                                      "no_op", {}, {});
+                return dispatch;
+            }
+            if (state != STORAGE_LIFECYCLE_RUNNING || !storageCtx) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Rejected, false,
+                                      "rejected", "invalid_state",
+                                      "Storage is not in a stoppable state.");
+                return dispatch;
+            }
+        } else if (action == "destroy") {
+            if (state == STORAGE_LIFECYCLE_NOT_INITIALIZED) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Noop, true,
+                                      "no_op", {}, {});
+                return dispatch;
+            }
+            if (state != STORAGE_LIFECYCLE_STOPPED || !storageCtx) {
+                settleWithoutDispatch(LifecycleDispatchDisposition::Rejected, false,
+                                      "rejected", "invalid_state",
+                                      "Storage must be stopped before it can be destroyed.");
+                return dispatch;
+            }
+        }
+    }
+
+    if (!activeLifecycleOperationId.empty()) {
+        const auto active = lifecycleOperations.find(activeLifecycleOperationId);
+        if (active != lifecycleOperations.end() && !active->second.settled) {
+            active->second.settled = true;
+            active->second.outcome = "failed";
+            ++lifecycleSequence;
+            lifecycleUpdatedAtMs = nodeLifecycleTimestampMs();
+            dispatch.events.push_back(lifecycleEventLocked(
+                active->second.action, activeLifecycleOperationId, "settled", "failed",
+                active->second.previousState,
+                "superseded", "Superseded by a legacy lifecycle action."));
+            rememberCompletedLifecycleOperationLocked(activeLifecycleOperationId);
+        }
+        activeLifecycleOperationId.clear();
+    }
+
+    std::uint8_t nextState = STORAGE_LIFECYCLE_NOT_INITIALIZED;
+    if (action == "initialize") nextState = STORAGE_LIFECYCLE_INITIALIZING;
+    else if (action == "start") nextState = STORAGE_LIFECYCLE_STARTING;
+    else if (action == "stop") nextState = STORAGE_LIFECYCLE_STOPPING;
+    else if (action == "destroy") nextState = STORAGE_LIFECYCLE_DESTROYING;
+
+    dispatch.previousState = state;
+    dispatch.generation = lifecycleGeneration.fetch_add(1) + 1;
+    lifecycleState.store(nextState);
+    lifecycleError.clear();
+    lifecycleErrorCode.clear();
+    lifecycleErrorAtMs = 0;
+    ++lifecycleSequence;
+    lifecycleUpdatedAtMs = nodeLifecycleTimestampMs();
+    dispatch.disposition = LifecycleDispatchDisposition::Dispatch;
+
+    if (strictAction) {
+        LifecycleOperation operation;
+        operation.action = action;
+        operation.requestFingerprint = requestFingerprint;
+        operation.accepted = true;
+        operation.previousState = state;
+        const auto inserted = lifecycleOperations.emplace(operationId, std::move(operation));
+        activeLifecycleOperationId = operationId;
+        dispatch.events.push_back(lifecycleEventLocked(
+            action, operationId, "accepted", "accepted", state));
+        dispatch.acknowledgement = acknowledgement(true, false, {}, {});
+        inserted.first->second.acknowledgement = dispatch.acknowledgement;
+    } else {
+        dispatch.events.push_back(lifecycleEventLocked(
+            action, {}, "accepted", "accepted", state));
+    }
+    return dispatch;
+}
+
+void StorageModuleImpl::settleLifecycleAction(const std::string& action,
+                                               const std::string& operationId,
+                                               std::uint64_t generation,
+                                               std::uint8_t previousState,
+                                               std::uint8_t successState,
+                                               std::uint8_t failureState,
+                                               bool success) {
+    std::string event;
+    {
+        std::lock_guard<std::mutex> lock(lifecycleMutex);
+        if (lifecycleGeneration.load() != generation) return;
+
+        lifecycleState.store(success ? successState : failureState);
+        lifecycleError = success ? std::string() : lifecycleFailureMessage(action);
+        lifecycleErrorCode = success ? std::string() : lifecycleFailureCode(action);
+        lifecycleErrorAtMs = success ? 0 : nodeLifecycleTimestampMs();
+        if (success && action == "initialize") ++lifecycleEpoch;
+
+        if (!operationId.empty()) {
+            const auto operation = lifecycleOperations.find(operationId);
+            if (operation != lifecycleOperations.end()) {
+                operation->second.settled = true;
+                operation->second.outcome = success ? "succeeded" : "failed";
+                rememberCompletedLifecycleOperationLocked(operationId);
+            }
+            if (activeLifecycleOperationId == operationId) {
+                activeLifecycleOperationId.clear();
+            }
+        }
+
+        ++lifecycleSequence;
+        lifecycleUpdatedAtMs = nodeLifecycleTimestampMs();
+        event = lifecycleEventLocked(action, operationId, "settled",
+                                     success ? "succeeded" : "failed",
+                                     previousState,
+                                     success ? std::string() : lifecycleErrorCode,
+                                     success ? std::string() : lifecycleError);
+    }
+    nodeChanged(event);
+}
+
+bool StorageModuleImpl::initializePrepared(const std::string& cfg,
+                                            const LifecycleDispatch& dispatch) {
+    auto* sctx = new SyncCtx();
+    storageCtx = storage_new(cfg.c_str(), syncCallback, sctx);
+    const SyncResult result = waitSync(sctx, 1000);
+    if (!result.ok || !storageCtx) {
+        storageCtx = nullptr;
+        settleLifecycleAction(dispatch.action, dispatch.operationId,
+                              dispatch.generation, dispatch.previousState,
+                              STORAGE_LIFECYCLE_STOPPED,
+                              STORAGE_LIFECYCLE_NOT_INITIALIZED, false);
+        return false;
+    }
+    settleLifecycleAction(dispatch.action, dispatch.operationId,
+                          dispatch.generation, dispatch.previousState,
+                          STORAGE_LIFECYCLE_STOPPED,
+                          STORAGE_LIFECYCLE_NOT_INITIALIZED, true);
+    return true;
+}
+
+bool StorageModuleImpl::startPrepared(const LifecycleDispatch& dispatch) {
+    if (!storageCtx) {
+        settleLifecycleAction(dispatch.action, dispatch.operationId,
+                              dispatch.generation, dispatch.previousState,
+                              STORAGE_LIFECYCLE_RUNNING, dispatch.previousState, false);
+        return false;
+    }
+    auto* ctx = new SimpleEventCtx(
+        this, &StorageModuleImpl::storageStart, &lifecycleGeneration,
+        dispatch.generation, dispatch.action, dispatch.operationId,
+        dispatch.previousState, STORAGE_LIFECYCLE_RUNNING, dispatch.previousState);
+    if (storage_start(storageCtx, asyncCallback, ctx) != RET_OK) {
+        delete ctx;
+        settleLifecycleAction(dispatch.action, dispatch.operationId,
+                              dispatch.generation, dispatch.previousState,
+                              STORAGE_LIFECYCLE_RUNNING, dispatch.previousState, false);
+        return false;
+    }
+    return true;
+}
+
+StdLogosResult StorageModuleImpl::stopPrepared(const LifecycleDispatch& dispatch) {
+    if (!storageCtx) {
+        settleLifecycleAction(dispatch.action, dispatch.operationId,
+                              dispatch.generation, dispatch.previousState,
+                              STORAGE_LIFECYCLE_STOPPED, dispatch.previousState, false);
+        return {false, {}, "Storage context not initialized."};
+    }
+    auto* ctx = new SimpleEventCtx(
+        this, &StorageModuleImpl::storageStop, &lifecycleGeneration,
+        dispatch.generation, dispatch.action, dispatch.operationId,
+        dispatch.previousState, STORAGE_LIFECYCLE_STOPPED, dispatch.previousState);
+    if (storage_stop(storageCtx, asyncCallback, ctx) != RET_OK) {
+        delete ctx;
+        settleLifecycleAction(dispatch.action, dispatch.operationId,
+                              dispatch.generation, dispatch.previousState,
+                              STORAGE_LIFECYCLE_STOPPED, dispatch.previousState, false);
+        return {false, {}, "Failed to send stop command."};
+    }
+    return {true, {}, ""};
+}
+
+StdLogosResult StorageModuleImpl::destroyPrepared(const LifecycleDispatch& dispatch) {
+    if (!storageCtx) {
+        settleLifecycleAction(dispatch.action, dispatch.operationId,
+                              dispatch.generation, dispatch.previousState,
+                              STORAGE_LIFECYCLE_NOT_INITIALIZED,
+                              dispatch.previousState, false);
+        return {false, {}, "Storage context not initialized."};
+    }
+    cancelAndJoinDownloadV2Workers();
+    syncCallNoArg(storageCtx, storage_close, 1000);
+    const int result = storage_destroy(storageCtx);
+    if (result == RET_OK) {
+        storageCtx = nullptr;
+        settleLifecycleAction(dispatch.action, dispatch.operationId,
+                              dispatch.generation, dispatch.previousState,
+                              STORAGE_LIFECYCLE_NOT_INITIALIZED,
+                              dispatch.previousState, true);
+        return {true, {}, ""};
+    }
+    settleLifecycleAction(dispatch.action, dispatch.operationId,
+                          dispatch.generation, dispatch.previousState,
+                          STORAGE_LIFECYCLE_NOT_INITIALIZED,
+                          dispatch.previousState, false);
+    return {false, {}, "Failed to destroy storage context."};
+}
+
 bool StorageModuleImpl::init(const std::string& cfg) {
     fprintf(stderr, "StorageModuleImpl::init called\n");
-
     if (storageCtx) {
         fprintf(stderr, "StorageModuleImpl::init: context already initialized\n");
         return false;
     }
-
-    auto* sctx = new SyncCtx();
-    storageCtx = storage_new(cfg.c_str(), syncCallback, sctx);
-    SyncResult r = waitSync(sctx, 1000);
-
-    if (!r.ok || !storageCtx) {
-        fprintf(stderr, "StorageModuleImpl::init failed: %s\n",
-                r.message.c_str());
-        storageCtx = nullptr;
-        lifecycleState.store(STORAGE_LIFECYCLE_NOT_INITIALIZED);
-        return false;
-    }
-    lifecycleGeneration.fetch_add(1);
-    lifecycleState.store(STORAGE_LIFECYCLE_STOPPED);
-    return true;
+    const LifecycleDispatch dispatch = beginLifecycleAction(
+        "initialize", {}, {}, false, {}, 0, 0, false);
+    emitLifecycleEvents(dispatch.events);
+    return dispatch.disposition == LifecycleDispatchDisposition::Dispatch
+        && initializePrepared(cfg, dispatch);
 }
 
 bool StorageModuleImpl::start() {
@@ -1371,56 +1879,37 @@ bool StorageModuleImpl::start() {
         fprintf(stderr, "StorageModuleImpl::start: context not initialized\n");
         return false;
     }
-    const std::uint8_t previousState = lifecycleState.load();
-    const std::uint64_t generation = lifecycleGeneration.fetch_add(1) + 1;
-    lifecycleState.store(STORAGE_LIFECYCLE_STARTING);
-    auto* ctx = new SimpleEventCtx(
-        this, &StorageModuleImpl::storageStart, &lifecycleState,
-        &lifecycleGeneration, generation, STORAGE_LIFECYCLE_RUNNING, previousState);
-    if (storage_start(storageCtx, asyncCallback, ctx) != RET_OK) {
-        if (lifecycleGeneration.load() == generation) {
-            lifecycleState.store(previousState);
-        }
-        delete ctx;
-        return false;
-    }
-    return true;
+    const LifecycleDispatch dispatch = beginLifecycleAction(
+        "start", {}, {}, false, {}, 0, 0, false);
+    emitLifecycleEvents(dispatch.events);
+    return dispatch.disposition == LifecycleDispatchDisposition::Dispatch
+        && startPrepared(dispatch);
 }
 
 StdLogosResult StorageModuleImpl::stop() {
     fprintf(stderr, "StorageModuleImpl::stop called\n");
     if (!storageCtx)
         return {false, {}, "Storage context not initialized."};
-    const std::uint8_t previousState = lifecycleState.load();
-    const std::uint64_t generation = lifecycleGeneration.fetch_add(1) + 1;
-    lifecycleState.store(STORAGE_LIFECYCLE_STOPPING);
-    auto* ctx = new SimpleEventCtx(
-        this, &StorageModuleImpl::storageStop, &lifecycleState,
-        &lifecycleGeneration, generation, STORAGE_LIFECYCLE_STOPPED, previousState);
-    if (storage_stop(storageCtx, asyncCallback, ctx) != RET_OK) {
-        if (lifecycleGeneration.load() == generation) {
-            lifecycleState.store(previousState);
-        }
-        delete ctx;
-        return {false, {}, "Failed to send stop command."};
+    const LifecycleDispatch dispatch = beginLifecycleAction(
+        "stop", {}, {}, false, {}, 0, 0, false);
+    emitLifecycleEvents(dispatch.events);
+    if (dispatch.disposition != LifecycleDispatchDisposition::Dispatch) {
+        return {false, {}, "Failed to prepare stop command."};
     }
-    return {true, {}, ""};
+    return stopPrepared(dispatch);
 }
 
 StdLogosResult StorageModuleImpl::destroy() {
     fprintf(stderr, "StorageModuleImpl::destroy called\n");
     if (!storageCtx)
         return {false, {}, "Storage context not initialized."};
-    lifecycleGeneration.fetch_add(1);
-    cancelAndJoinDownloadV2Workers();
-    syncCallNoArg(storageCtx, storage_close, 1000);
-    int ret = storage_destroy(storageCtx);
-    if (ret == RET_OK) {
-        storageCtx = nullptr;
-        lifecycleState.store(STORAGE_LIFECYCLE_NOT_INITIALIZED);
-        return {true, {}, ""};
+    const LifecycleDispatch dispatch = beginLifecycleAction(
+        "destroy", {}, {}, false, {}, 0, 0, false);
+    emitLifecycleEvents(dispatch.events);
+    if (dispatch.disposition != LifecycleDispatchDisposition::Dispatch) {
+        return {false, {}, "Failed to prepare destruction."};
     }
-    return {false, {}, "Failed to destroy storage context."};
+    return destroyPrepared(dispatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,10 +1933,170 @@ std::string StorageModuleImpl::moduleVersion() {
 LogosMap StorageModuleImpl::lifecycleStatus() {
     const std::uint8_t state = lifecycleState.load();
     return {
-        {"initialized", state != STORAGE_LIFECYCLE_NOT_INITIALIZED},
+        {"initialized", state != STORAGE_LIFECYCLE_NOT_INITIALIZED
+                            && state != STORAGE_LIFECYCLE_INITIALIZING},
         {"running", state == STORAGE_LIFECYCLE_RUNNING},
         {"state", storageLifecycleStateName(state)},
     };
+}
+
+std::string StorageModuleImpl::nodeStatus() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex);
+    return lifecycleSnapshotLocked();
+}
+
+std::string StorageModuleImpl::nodeAction(const std::string& request) {
+    const auto rejected = [this](const std::string& code,
+                                 const std::string& message) {
+        std::lock_guard<std::mutex> lock(lifecycleMutex);
+        json result;
+        result["schema"] = NODE_LIFECYCLE_ACK_SCHEMA;
+        result["version"] = 1;
+        result["operation_id"] = nullptr;
+        result["accepted"] = false;
+        result["duplicate"] = false;
+        result["instance_id"] = lifecycleInstanceId;
+        result["epoch"] = lifecycleEpoch;
+        result["sequence"] = lifecycleSequence;
+        result["state"] = nodeLifecycleStateName(lifecycleState.load());
+        result["error"] = nodeLifecycleError(
+            code, message, nodeLifecycleTimestampMs());
+        return result.dump();
+    };
+
+    if (request.size() > MAX_NODE_LIFECYCLE_REQUEST_BYTES) {
+        return rejected("request_too_large",
+                        "Lifecycle request exceeds the supported size.");
+    }
+
+    json input;
+    try {
+        input = json::parse(request);
+    } catch (const std::exception&) {
+        return rejected("invalid_request", "Lifecycle request must be a JSON object.");
+    }
+    if (!input.is_object()) {
+        return rejected("invalid_request", "Lifecycle request must be a JSON object.");
+    }
+    for (const auto& item : input.items()) {
+        const std::string& key = item.key();
+        if (key != "schema" && key != "version" && key != "operation_id"
+            && key != "action" && key != "expected" && key != "parameters") {
+            return rejected("invalid_request", "Lifecycle request contains an unsupported field.");
+        }
+    }
+
+    const auto schema = input.find("schema");
+    if (schema == input.end() || !schema->is_string()
+        || schema->get<std::string>() != NODE_LIFECYCLE_COMMAND_SCHEMA) {
+        return rejected("invalid_request", "Unsupported lifecycle request schema.");
+    }
+    const auto version = input.find("version");
+    if (version == input.end() || !version->is_number_integer()
+        || version->get<int>() != 1) {
+        return rejected("invalid_request", "Unsupported lifecycle request version.");
+    }
+    const auto operationId = input.find("operation_id");
+    if (operationId == input.end() || !operationId->is_string()) {
+        return rejected("invalid_request", "Lifecycle request requires an operation_id.");
+    }
+    const std::string operation = operationId->get<std::string>();
+    if (!isValidNodeLifecycleOperationId(operation)) {
+        return rejected("invalid_request", "Lifecycle operation_id is invalid.");
+    }
+    const auto actionValue = input.find("action");
+    if (actionValue == input.end() || !actionValue->is_string()) {
+        return rejected("invalid_request", "Lifecycle request requires an action.");
+    }
+    const std::string action = actionValue->get<std::string>();
+    if (action != "initialize" && action != "start"
+        && action != "stop" && action != "destroy") {
+        return rejected("invalid_request", "Unsupported lifecycle action.");
+    }
+
+    const auto parseUnsigned = [](const json& value, std::uint64_t& parsed) {
+        if (value.is_number_unsigned()) {
+            parsed = value.get<std::uint64_t>();
+            return true;
+        }
+        if (value.is_number_integer()) {
+            const auto signedValue = value.get<std::int64_t>();
+            if (signedValue >= 0) {
+                parsed = static_cast<std::uint64_t>(signedValue);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool hasExpectedSnapshot = false;
+    std::string expectedInstanceId;
+    std::uint64_t expectedEpoch = 0;
+    std::uint64_t expectedSequence = 0;
+    const auto expected = input.find("expected");
+    if (expected != input.end()) {
+        if (!expected->is_object() || expected->size() != 3
+            || !expected->contains("instance_id")
+            || !expected->contains("epoch")
+            || !expected->contains("sequence")
+            || !expected->at("instance_id").is_string()
+            || !parseUnsigned(expected->at("epoch"), expectedEpoch)
+            || !parseUnsigned(expected->at("sequence"), expectedSequence)) {
+            return rejected("invalid_request",
+                            "Lifecycle expected snapshot must contain instance_id, epoch, and sequence.");
+        }
+        expectedInstanceId = expected->at("instance_id").get<std::string>();
+        hasExpectedSnapshot = true;
+    }
+
+    json parameters = json::object();
+    const auto parametersValue = input.find("parameters");
+    if (parametersValue != input.end()) {
+        if (!parametersValue->is_object()) {
+            return rejected("invalid_request", "Lifecycle parameters must be an object.");
+        }
+        parameters = *parametersValue;
+    }
+
+    std::string initializationConfig;
+    if (action == "initialize") {
+        const auto config = parameters.find("config");
+        if (config == parameters.end() || !config->is_string()) {
+            return rejected("invalid_request", "Initialize requires parameters.config.");
+        }
+        if (parameters.size() != 1) {
+            return rejected("invalid_request", "Initialize accepts only parameters.config.");
+        }
+        initializationConfig = config->get<std::string>();
+        if (initializationConfig.size() > MAX_NODE_LIFECYCLE_CONFIG_BYTES
+            || containsEmbeddedNul(initializationConfig)) {
+            return rejected("invalid_request",
+                            "Initialize config is invalid or exceeds the supported size.");
+        }
+    } else if (!parameters.empty()) {
+        return rejected("invalid_request",
+                        "This lifecycle action does not accept parameters.");
+    }
+
+    const std::string requestFingerprint = input.dump();
+    const LifecycleDispatch dispatch = beginLifecycleAction(
+        action, operation, requestFingerprint, hasExpectedSnapshot,
+        expectedInstanceId, expectedEpoch, expectedSequence, true);
+    emitLifecycleEvents(dispatch.events);
+    if (dispatch.disposition != LifecycleDispatchDisposition::Dispatch) {
+        return dispatch.acknowledgement;
+    }
+
+    if (action == "initialize") {
+        initializePrepared(initializationConfig, dispatch);
+    } else if (action == "start") {
+        startPrepared(dispatch);
+    } else if (action == "stop") {
+        stopPrepared(dispatch);
+    } else {
+        destroyPrepared(dispatch);
+    }
+    return dispatch.acknowledgement;
 }
 
 StdLogosResult StorageModuleImpl::dataDir() {

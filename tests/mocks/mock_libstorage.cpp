@@ -54,6 +54,17 @@ static bool s_holdNextDownloadStream = false;
 static StorageCallback s_heldDownloadStreamCallback = nullptr;
 static void* s_heldDownloadStreamUserData = nullptr;
 
+struct HeldLifecycleCallback {
+    bool holdNext = false;
+    StorageCallback callback = nullptr;
+    void* userData = nullptr;
+};
+
+static std::mutex s_lifecycleMutex;
+static std::condition_variable s_lifecycleReady;
+static HeldLifecycleCallback s_heldStart;
+static HeldLifecycleCallback s_heldStop;
+
 void mockStorageSetNextDownloadChunkPayload(const char* payload) {
     std::lock_guard<std::mutex> lock(s_downloadChunkMutex);
     s_nextDownloadChunkPayload = payload ? payload : "";
@@ -208,6 +219,61 @@ void mockStorageCompleteHeldDownloadStream(int result, const char* message) {
     callback(result, terminal, strlen(terminal), userData);
 }
 
+static void holdNextLifecycle(HeldLifecycleCallback& held) {
+    std::lock_guard<std::mutex> lock(s_lifecycleMutex);
+    held.holdNext = true;
+    held.callback = nullptr;
+    held.userData = nullptr;
+}
+
+static bool waitForHeldLifecycle(HeldLifecycleCallback& held, int timeoutMs) {
+    std::unique_lock<std::mutex> lock(s_lifecycleMutex);
+    return s_lifecycleReady.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [&held] {
+            return held.callback != nullptr;
+        });
+}
+
+static void completeHeldLifecycle(HeldLifecycleCallback& held, int result,
+                                  const char* message) {
+    StorageCallback callback = nullptr;
+    void* userData = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s_lifecycleMutex);
+        callback = held.callback;
+        userData = held.userData;
+        held.callback = nullptr;
+        held.userData = nullptr;
+    }
+    if (!callback) return;
+    const char* terminal = message ? message : "";
+    callback(result, terminal, strlen(terminal), userData);
+}
+
+void mockStorageHoldNextStart() {
+    holdNextLifecycle(s_heldStart);
+}
+
+bool mockStorageWaitForHeldStart(int timeoutMs) {
+    return waitForHeldLifecycle(s_heldStart, timeoutMs);
+}
+
+void mockStorageCompleteHeldStart(int result, const char* message) {
+    completeHeldLifecycle(s_heldStart, result, message);
+}
+
+void mockStorageHoldNextStop() {
+    holdNextLifecycle(s_heldStop);
+}
+
+bool mockStorageWaitForHeldStop(int timeoutMs) {
+    return waitForHeldLifecycle(s_heldStop, timeoutMs);
+}
+
+void mockStorageCompleteHeldStop(int result, const char* message) {
+    completeHeldLifecycle(s_heldStop, result, message);
+}
+
 // Helper: invoke callback with RET_OK and the string from the mock store.
 static void invokeOk(const char* funcName, StorageCallback cb, void* userData) {
     if (!cb) return;
@@ -247,12 +313,32 @@ int storage_destroy(void* ctx) {
 
 int storage_start(void* ctx, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_start");
+    {
+        std::lock_guard<std::mutex> lock(s_lifecycleMutex);
+        if (s_heldStart.holdNext) {
+            s_heldStart.holdNext = false;
+            s_heldStart.callback = cb;
+            s_heldStart.userData = userData;
+            s_lifecycleReady.notify_all();
+            return RET_OK;
+        }
+    }
     invokeOk("storage_start", cb, userData);
     return RET_OK;
 }
 
 int storage_stop(void* ctx, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_stop");
+    {
+        std::lock_guard<std::mutex> lock(s_lifecycleMutex);
+        if (s_heldStop.holdNext) {
+            s_heldStop.holdNext = false;
+            s_heldStop.callback = cb;
+            s_heldStop.userData = userData;
+            s_lifecycleReady.notify_all();
+            return RET_OK;
+        }
+    }
     invokeOk("storage_stop", cb, userData);
     return RET_OK;
 }

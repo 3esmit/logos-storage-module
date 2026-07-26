@@ -22,3 +22,11 @@ void mockStorageCompleteHeldDownloadCancel(int result, const char* message);
 void mockStorageHoldNextDownloadStream();
 bool mockStorageWaitForHeldDownloadStream(int timeoutMs);
 void mockStorageCompleteHeldDownloadStream(int result, const char* message);
+
+void mockStorageHoldNextStart();
+bool mockStorageWaitForHeldStart(int timeoutMs);
+void mockStorageCompleteHeldStart(int result, const char* message);
+
+void mockStorageHoldNextStop();
+bool mockStorageWaitForHeldStop(int timeoutMs);
+void mockStorageCompleteHeldStop(int result, const char* message);

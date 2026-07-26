@@ -116,6 +116,16 @@ public:
     /// The method is synchronous.
     std::string moduleVersion();
 
+    /// Return the module-owned Storage lifecycle state.
+    ///
+    /// The returned map contains `initialized`, `running`, and `state`.
+    /// `state` is one of `not_initialized`, `stopped`, `starting`, `running`,
+    /// or `stopping`. This reflects lifecycle commands and their completion
+    /// callbacks; it does not infer state from a network socket.
+    ///
+    /// The method is synchronous and is callable before `init()`.
+    LogosMap lifecycleStatus();
+
     /// Get the storage data directory path.
     ///
     /// Returns StdLogosResult::value as a std::string on success.
@@ -565,6 +575,8 @@ private:
     };
 
     void* storageCtx;
+    std::atomic<std::uint8_t> lifecycleState;
+    std::atomic<std::uint64_t> lifecycleGeneration;
 
     std::shared_ptr<DownloadRegistry> downloadRegistry;
     std::mutex downloadV2WorkersMutex;

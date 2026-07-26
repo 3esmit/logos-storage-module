@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -21,6 +22,7 @@ extern "C" {
 
 struct DownloadV2State;
 struct DownloadRegistry;
+struct SimpleEventCtx;
 
 /// Logos Storage Module API.
 ///
@@ -125,6 +127,20 @@ public:
     ///
     /// The method is synchronous and is callable before `init()`.
     LogosMap lifecycleStatus();
+
+    /// Return the versioned node lifecycle snapshot used by host UIs.
+    ///
+    /// This is a bounded JSON object and is callable before `init()`. It is
+    /// intentionally separate from the legacy lifecycleStatus() map so that
+    /// existing callers retain their current shape and state spelling.
+    std::string nodeStatus();
+
+    /// Request a versioned, caller-correlated lifecycle operation.
+    ///
+    /// The request is a bounded JSON object with a caller-provided
+    /// `operation_id`. The return value only acknowledges or rejects the
+    /// request; accepted asynchronous work settles through nodeChanged().
+    std::string nodeAction(const std::string& request);
 
     /// Get the storage data directory path.
     ///
@@ -456,6 +472,12 @@ public:
     /// with the event below.
     /// @{
 logos_events:
+    /// Emits versioned lifecycle action and state-change envelopes.
+    ///
+    /// New consumers should use this together with nodeStatus() and
+    /// nodeAction(). Legacy storageStart/storageStop events remain unchanged.
+    void nodeChanged(const std::string& event);
+
     /// Emitted when start() has finished starting the node.
     /// @code{.json}
     /// {
@@ -569,6 +591,33 @@ logos_events:
     /// @}
 
 private:
+    enum class LifecycleDispatchDisposition : std::uint8_t {
+        Dispatch,
+        Noop,
+        Rejected,
+        Duplicate,
+    };
+
+    struct LifecycleOperation {
+        std::string action;
+        std::string requestFingerprint;
+        bool accepted = false;
+        bool settled = false;
+        std::string outcome;
+        std::uint8_t previousState = 0;
+        std::string acknowledgement;
+    };
+
+    struct LifecycleDispatch {
+        LifecycleDispatchDisposition disposition = LifecycleDispatchDisposition::Rejected;
+        std::string action;
+        std::string operationId;
+        std::uint8_t previousState = 0;
+        std::uint64_t generation = 0;
+        std::string acknowledgement;
+        std::vector<std::string> events;
+    };
+
     struct DownloadV2Worker {
         std::shared_ptr<DownloadV2State> state;
         std::thread thread;
@@ -577,6 +626,18 @@ private:
     void* storageCtx;
     std::atomic<std::uint8_t> lifecycleState;
     std::atomic<std::uint64_t> lifecycleGeneration;
+
+    mutable std::mutex lifecycleMutex;
+    std::string lifecycleInstanceId;
+    std::uint64_t lifecycleEpoch = 0;
+    std::uint64_t lifecycleSequence = 0;
+    std::int64_t lifecycleUpdatedAtMs = 0;
+    std::int64_t lifecycleErrorAtMs = 0;
+    std::string lifecycleErrorCode;
+    std::string lifecycleError;
+    std::string activeLifecycleOperationId;
+    std::unordered_map<std::string, LifecycleOperation> lifecycleOperations;
+    std::deque<std::string> completedLifecycleOperationIds;
 
     std::shared_ptr<DownloadRegistry> downloadRegistry;
     std::mutex downloadV2WorkersMutex;
@@ -593,9 +654,42 @@ private:
     void reapFinishedDownloadV2Workers();
     void cancelAndJoinDownloadV2Workers();
 
+    LifecycleDispatch beginLifecycleAction(const std::string& action,
+                                           const std::string& operationId,
+                                           const std::string& requestFingerprint,
+                                           bool hasExpectedSnapshot,
+                                           const std::string& expectedInstanceId,
+                                           std::uint64_t expectedEpoch,
+                                           std::uint64_t expectedSequence,
+                                           bool strictAction);
+    bool initializePrepared(const std::string& cfg,
+                            const LifecycleDispatch& dispatch);
+    bool startPrepared(const LifecycleDispatch& dispatch);
+    StdLogosResult stopPrepared(const LifecycleDispatch& dispatch);
+    StdLogosResult destroyPrepared(const LifecycleDispatch& dispatch);
+    void settleLifecycleAction(const std::string& action,
+                               const std::string& operationId,
+                               std::uint64_t generation,
+                               std::uint8_t previousState,
+                               std::uint8_t successState,
+                               std::uint8_t failureState,
+                               bool success);
+    std::string lifecycleSnapshotLocked() const;
+    std::string lifecycleEventLocked(const std::string& action,
+                                     const std::string& operationId,
+                                     const std::string& phase,
+                                     const std::string& outcome,
+                                     std::uint8_t previousState,
+                                     const std::string& errorCode = {},
+                                     const std::string& errorMessage = {}) const;
+    void emitLifecycleEvents(const std::vector<std::string>& events);
+    void rememberCompletedLifecycleOperationLocked(const std::string& operationId);
+
     /// Shared internal download helper used by downloadToUrl and downloadChunks.
     /// Returns session ID (= cid) on success, empty string on failure.
     std::string downloadChunksInternal(const std::string& cid,
                                        const std::string& filepath,
                                        bool local, int64_t chunkSize);
+
+    friend struct SimpleEventCtx;
 };

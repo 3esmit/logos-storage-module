@@ -2,6 +2,15 @@
 
 Notable Storage Module package changes are recorded here.
 
+## [2.3.0] - Alpha
+
+### Added
+
+- Versioned `nodeStatus`, `nodeAction`, and `nodeChanged` lifecycle contract
+  for correlated host control, ordered state observation, and safe retry.
+- Lifecycle transition events for legacy Storage lifecycle calls, while keeping
+  existing `lifecycleStatus`, `storageStart`, and `storageStop` APIs intact.
+
 ## [2.2.0] - Alpha
 
 ### Added

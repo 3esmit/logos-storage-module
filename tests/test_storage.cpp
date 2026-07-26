@@ -32,6 +32,36 @@ static void assertLifecycleStatus(const LogosMap& status, bool initialized,
     LOGOS_ASSERT_EQ(status.at("state").get<std::string>(), std::string(state));
 }
 
+static json readNodeStatus(StorageModuleImpl& impl) {
+    return json::parse(impl.nodeStatus());
+}
+
+static json invokeNodeAction(StorageModuleImpl& impl, const json& request) {
+    return json::parse(impl.nodeAction(request.dump()));
+}
+
+static json nodeChangedEvent(const logos_test::EventCapture::Entry& entry) {
+    LOGOS_ASSERT_EQ(entry.name, std::string("nodeChanged"));
+    return json::parse(entry.data);
+}
+
+static json lifecycleCommand(const std::string& operationId,
+                             const std::string& action,
+                             const json& parameters = json::object()) {
+    json command = {
+        {"schema", "logos.managed_node_lifecycle.command"},
+        {"version", 1},
+        {"operation_id", operationId},
+        {"action", action},
+    };
+    if (!parameters.empty()) command["parameters"] = parameters;
+    return command;
+}
+
+static const json& lifecycleEventStatus(const json& event) {
+    return event.at("status");
+}
+
 static std::vector<logos_test::EventCapture::Entry> waitForEventCount(
     logos_test::EventCapture& events, const std::string& name, size_t count,
     int timeoutMs) {
@@ -119,6 +149,313 @@ LOGOS_TEST(lifecycleStatus_ignores_stale_terminal_callback) {
 
     LOGOS_ASSERT_TRUE(impl->destroy().success);
     delete impl;
+}
+
+LOGOS_TEST(nodeStatus_reports_a_versioned_lifecycle_snapshot) {
+    StorageModuleImpl impl;
+
+    const json status = readNodeStatus(impl);
+    LOGOS_ASSERT_EQ(status.at("schema").get<std::string>(),
+                    std::string("logos.managed_node_lifecycle.snapshot"));
+    LOGOS_ASSERT_EQ(status.at("version").get<int>(), 1);
+    LOGOS_ASSERT_FALSE(status.at("instance_id").get<std::string>().empty());
+    LOGOS_ASSERT_EQ(status.at("epoch").get<std::uint64_t>(), 0U);
+    LOGOS_ASSERT_EQ(status.at("sequence").get<std::uint64_t>(), 0U);
+    LOGOS_ASSERT_EQ(status.at("state").get<std::string>(), std::string("uninitialized"));
+    LOGOS_ASSERT_EQ(status.at("health").get<std::string>(), std::string("unknown"));
+    LOGOS_ASSERT_EQ(status.at("scope").at("kind").get<std::string>(),
+                    std::string("storage"));
+    LOGOS_ASSERT_TRUE(status.at("pending_operation").is_null());
+    LOGOS_ASSERT_TRUE(status.at("last_completed_operation").is_null());
+    LOGOS_ASSERT_TRUE(status.at("last_error").is_null());
+    const auto actions = status.at("supported_actions").get<std::vector<std::string>>();
+    LOGOS_ASSERT_EQ(actions.size(), static_cast<size_t>(1));
+    LOGOS_ASSERT_EQ(actions.at(0), std::string("initialize"));
+    LOGOS_ASSERT_TRUE(status.at("updated_at_ms").get<std::int64_t>() > 0);
+}
+
+LOGOS_TEST(legacy_lifecycle_calls_emit_uncorrelated_node_changed_events) {
+    auto t = LogosTestContext("storage_module");
+    t.mockCFunction("storage_new").returns(1);
+    logos_test::EventCapture events;
+    StorageModuleImpl impl;
+
+    LOGOS_ASSERT_TRUE(impl.init("{\"data-dir\":\"/tmp/test\"}"));
+    const auto initializedEvents = waitForEventCount(events, "nodeChanged", 2, 1000);
+    LOGOS_ASSERT_EQ(initializedEvents.size(), static_cast<size_t>(2));
+    const json initializedAccepted = nodeChangedEvent(initializedEvents.at(0));
+    LOGOS_ASSERT_EQ(initializedAccepted.at("schema").get<std::string>(),
+                    std::string("logos.managed_node_lifecycle.event"));
+    LOGOS_ASSERT_EQ(initializedAccepted.at("version").get<int>(), 1);
+    LOGOS_ASSERT_TRUE(initializedAccepted.at("operation_id").is_null());
+    LOGOS_ASSERT_EQ(initializedAccepted.at("action").get<std::string>(),
+                    std::string("initialize"));
+    LOGOS_ASSERT_EQ(initializedAccepted.at("phase").get<std::string>(),
+                    std::string("accepted"));
+    LOGOS_ASSERT_EQ(nodeChangedEvent(initializedEvents.at(1)).at("outcome").get<std::string>(),
+                    std::string("succeeded"));
+
+    mockStorageHoldNextStart();
+    LOGOS_ASSERT_TRUE(impl.start());
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStart(1000));
+    const auto startingEvents = waitForEventCount(events, "nodeChanged", 3, 1000);
+    LOGOS_ASSERT_EQ(startingEvents.size(), static_cast<size_t>(3));
+    const json accepted = nodeChangedEvent(startingEvents.at(2));
+    LOGOS_ASSERT_TRUE(accepted.at("operation_id").is_null());
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(accepted).at("state").get<std::string>(),
+                    std::string("starting"));
+
+    mockStorageCompleteHeldStart(RET_OK, "started");
+    const auto settledEvents = waitForEventCount(events, "nodeChanged", 4, 1000);
+    LOGOS_ASSERT_EQ(settledEvents.size(), static_cast<size_t>(4));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(nodeChangedEvent(settledEvents.at(3))).at("state")
+                        .get<std::string>(),
+                    std::string("running"));
+
+    LOGOS_ASSERT_TRUE(impl.stop().success);
+    LOGOS_ASSERT_TRUE(impl.destroy().success);
+}
+
+LOGOS_TEST(nodeAction_initializes_with_correlated_ordered_events) {
+    auto t = LogosTestContext("storage_module");
+    t.mockCFunction("storage_new").returns(1);
+    logos_test::EventCapture events;
+    StorageModuleImpl impl;
+    const std::string secret = "must-not-appear-in-lifecycle-output";
+    const json request = lifecycleCommand(
+        "initialize-node-v1", "initialize",
+        {{"config", json({{"data-dir", "/tmp/test"},
+                             {"net-privkey", secret}}).dump()}});
+
+    const json acknowledgement = invokeNodeAction(impl, request);
+    LOGOS_ASSERT_EQ(acknowledgement.at("schema").get<std::string>(),
+                    std::string("logos.managed_node_lifecycle.ack"));
+    LOGOS_ASSERT_EQ(acknowledgement.at("version").get<int>(), 1);
+    LOGOS_ASSERT_TRUE(acknowledgement.at("accepted").get<bool>());
+    LOGOS_ASSERT_FALSE(acknowledgement.at("duplicate").get<bool>());
+    LOGOS_ASSERT_TRUE(acknowledgement.at("error").is_null());
+
+    const auto entries = waitForEventCount(events, "nodeChanged", 2, 1000);
+    LOGOS_ASSERT_EQ(entries.size(), static_cast<size_t>(2));
+    const json accepted = nodeChangedEvent(entries.at(0));
+    const json settled = nodeChangedEvent(entries.at(1));
+    LOGOS_ASSERT_EQ(accepted.at("phase").get<std::string>(), std::string("accepted"));
+    LOGOS_ASSERT_EQ(accepted.at("outcome").get<std::string>(), std::string("accepted"));
+    LOGOS_ASSERT_EQ(accepted.at("action").get<std::string>(), std::string("initialize"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(accepted).at("state").get<std::string>(),
+                    std::string("initializing"));
+    LOGOS_ASSERT_EQ(settled.at("phase").get<std::string>(), std::string("settled"));
+    LOGOS_ASSERT_EQ(settled.at("outcome").get<std::string>(), std::string("succeeded"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("state").get<std::string>(),
+                    std::string("stopped"));
+    LOGOS_ASSERT_TRUE(settled.at("sequence").get<std::uint64_t>()
+                      > accepted.at("sequence").get<std::uint64_t>());
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("epoch").get<std::uint64_t>(), 1U);
+    const auto actions = lifecycleEventStatus(settled)
+        .at("supported_actions").get<std::vector<std::string>>();
+    LOGOS_ASSERT_EQ(actions.size(), static_cast<size_t>(2));
+    LOGOS_ASSERT_EQ(actions.at(0), std::string("start"));
+    LOGOS_ASSERT_EQ(actions.at(1), std::string("destroy"));
+    LOGOS_ASSERT_TRUE(settled.dump().find(secret) == std::string::npos);
+    LOGOS_ASSERT_TRUE(readNodeStatus(impl).dump().find(secret) == std::string::npos);
+
+    LOGOS_ASSERT_TRUE(impl.destroy().success);
+}
+
+LOGOS_TEST(nodeAction_replays_an_inflight_operation_without_duplicate_dispatch) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+    logos_test::EventCapture events;
+    mockStorageHoldNextStart();
+    const json request = lifecycleCommand("start-node-v1", "start");
+
+    const json first = invokeNodeAction(*impl, request);
+    LOGOS_ASSERT_TRUE(first.at("accepted").get<bool>());
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStart(1000));
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_start"), 1);
+    const auto acceptedEvents = waitForEventCount(events, "nodeChanged", 1, 1000);
+    LOGOS_ASSERT_EQ(acceptedEvents.size(), static_cast<size_t>(1));
+    const json accepted = nodeChangedEvent(acceptedEvents.at(0));
+    LOGOS_ASSERT_EQ(accepted.at("phase").get<std::string>(), std::string("accepted"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(accepted).at("state").get<std::string>(),
+                    std::string("starting"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(accepted).at("pending_operation")
+                        .at("operation_id").get<std::string>(),
+                    std::string("start-node-v1"));
+
+    const json replay = invokeNodeAction(*impl, request);
+    LOGOS_ASSERT_TRUE(replay.at("accepted").get<bool>());
+    LOGOS_ASSERT_TRUE(replay.at("duplicate").get<bool>());
+    LOGOS_ASSERT_EQ(replay.at("operation_id").get<std::string>(),
+                    first.at("operation_id").get<std::string>());
+    LOGOS_ASSERT_EQ(replay.at("sequence").get<std::uint64_t>(),
+                    first.at("sequence").get<std::uint64_t>());
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_start"), 1);
+    LOGOS_ASSERT_EQ(events.all("nodeChanged").size(), static_cast<size_t>(1));
+
+    mockStorageCompleteHeldStart(RET_OK, "started");
+    const auto settledEvents = waitForEventCount(events, "nodeChanged", 2, 1000);
+    LOGOS_ASSERT_EQ(settledEvents.size(), static_cast<size_t>(2));
+    const json settled = nodeChangedEvent(settledEvents.at(1));
+    LOGOS_ASSERT_EQ(settled.at("phase").get<std::string>(), std::string("settled"));
+    LOGOS_ASSERT_EQ(settled.at("outcome").get<std::string>(), std::string("succeeded"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("state").get<std::string>(),
+                    std::string("running"));
+
+    LOGOS_ASSERT_TRUE(impl->stop().success);
+    LOGOS_ASSERT_TRUE(impl->destroy().success);
+    delete impl;
+}
+
+LOGOS_TEST(nodeAction_reports_safe_start_failure_without_callback_payload) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+    logos_test::EventCapture events;
+    mockStorageHoldNextStart();
+    const json request = lifecycleCommand("failing-start-node-v1", "start");
+
+    LOGOS_ASSERT_TRUE(invokeNodeAction(*impl, request).at("accepted").get<bool>());
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStart(1000));
+    mockStorageCompleteHeldStart(RET_ERR, "backend secret path /private/key");
+
+    const auto entries = waitForEventCount(events, "nodeChanged", 2, 1000);
+    LOGOS_ASSERT_EQ(entries.size(), static_cast<size_t>(2));
+    const json settled = nodeChangedEvent(entries.at(1));
+    LOGOS_ASSERT_EQ(settled.at("outcome").get<std::string>(), std::string("failed"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("state").get<std::string>(),
+                    std::string("stopped"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("last_error").at("code")
+                        .get<std::string>(),
+                    std::string("start_failed"));
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("last_error").at("message")
+                        .get<std::string>(),
+                    std::string("Storage start failed."));
+    LOGOS_ASSERT_EQ(settled.at("error").at("code").get<std::string>(),
+                    std::string("start_failed"));
+    LOGOS_ASSERT_TRUE(settled.dump().find("backend secret") == std::string::npos);
+
+    LOGOS_ASSERT_TRUE(impl->destroy().success);
+    delete impl;
+}
+
+LOGOS_TEST(nodeAction_rejects_stale_or_reused_requests_without_side_effects) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+    logos_test::EventCapture events;
+    const json currentStatus = readNodeStatus(*impl);
+    json stale = lifecycleCommand("stale-start-node-v1", "start");
+    stale["expected"] = {
+        {"instance_id", currentStatus.at("instance_id")},
+        {"epoch", currentStatus.at("epoch")},
+        {"sequence", currentStatus.at("sequence").get<std::uint64_t>() + 1},
+    };
+
+    const json staleAcknowledgement = invokeNodeAction(*impl, stale);
+    LOGOS_ASSERT_FALSE(staleAcknowledgement.at("accepted").get<bool>());
+    LOGOS_ASSERT_EQ(staleAcknowledgement.at("error").at("code").get<std::string>(),
+                    std::string("state_mismatch"));
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_start"), 0);
+    const auto staleEvents = waitForEventCount(events, "nodeChanged", 1, 1000);
+    LOGOS_ASSERT_EQ(staleEvents.size(), static_cast<size_t>(1));
+    const json staleEvent = nodeChangedEvent(staleEvents.at(0));
+    LOGOS_ASSERT_EQ(staleEvent.at("outcome").get<std::string>(), std::string("rejected"));
+    LOGOS_ASSERT_EQ(staleEvent.at("error").at("code").get<std::string>(),
+                    std::string("state_mismatch"));
+
+    mockStorageHoldNextStart();
+    const json started = lifecycleCommand("reused-node-v1", "start");
+    LOGOS_ASSERT_TRUE(invokeNodeAction(*impl, started).at("accepted").get<bool>());
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStart(1000));
+    const json reused = lifecycleCommand("reused-node-v1", "stop");
+    const json reusedAcknowledgement = invokeNodeAction(*impl, reused);
+    LOGOS_ASSERT_FALSE(reusedAcknowledgement.at("accepted").get<bool>());
+    LOGOS_ASSERT_EQ(reusedAcknowledgement.at("error").at("code").get<std::string>(),
+                    std::string("operation_id_conflict"));
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_stop"), 0);
+    LOGOS_ASSERT_EQ(events.all("nodeChanged").size(), static_cast<size_t>(2));
+    mockStorageCompleteHeldStart(RET_OK, "started");
+
+    LOGOS_ASSERT_TRUE(impl->stop().success);
+    LOGOS_ASSERT_TRUE(impl->destroy().success);
+    delete impl;
+}
+
+LOGOS_TEST(nodeAction_rejects_destroy_while_start_is_pending) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+    logos_test::EventCapture events;
+    mockStorageHoldNextStart();
+    const json start = lifecycleCommand("start-before-destroy-v1", "start");
+    LOGOS_ASSERT_TRUE(invokeNodeAction(*impl, start).at("accepted").get<bool>());
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStart(1000));
+
+    const json destroy = lifecycleCommand("destroy-while-starting-v1", "destroy");
+    const json acknowledgement = invokeNodeAction(*impl, destroy);
+    LOGOS_ASSERT_FALSE(acknowledgement.at("accepted").get<bool>());
+    LOGOS_ASSERT_EQ(acknowledgement.at("error").at("code").get<std::string>(),
+                    std::string("operation_in_progress"));
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_destroy"), 0);
+
+    mockStorageCompleteHeldStart(RET_OK, "started");
+    const auto entries = waitForEventCount(events, "nodeChanged", 3, 1000);
+    LOGOS_ASSERT_EQ(entries.size(), static_cast<size_t>(3));
+    LOGOS_ASSERT_EQ(nodeChangedEvent(entries.at(1)).at("outcome").get<std::string>(),
+                    std::string("rejected"));
+    LOGOS_ASSERT_EQ(nodeChangedEvent(entries.at(2)).at("outcome").get<std::string>(),
+                    std::string("succeeded"));
+
+    LOGOS_ASSERT_TRUE(impl->stop().success);
+    LOGOS_ASSERT_TRUE(impl->destroy().success);
+    delete impl;
+}
+
+LOGOS_TEST(nodeAction_noop_is_accepted_then_settled_without_an_error) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    StorageModuleImpl impl;
+    const json request = lifecycleCommand("destroy-uninitialized-node-v1", "destroy");
+
+    const json acknowledgement = invokeNodeAction(impl, request);
+    LOGOS_ASSERT_TRUE(acknowledgement.at("accepted").get<bool>());
+    LOGOS_ASSERT_FALSE(acknowledgement.at("duplicate").get<bool>());
+    LOGOS_ASSERT_TRUE(acknowledgement.at("error").is_null());
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_destroy"), 0);
+
+    const auto entries = waitForEventCount(events, "nodeChanged", 2, 1000);
+    LOGOS_ASSERT_EQ(entries.size(), static_cast<size_t>(2));
+    const json accepted = nodeChangedEvent(entries.at(0));
+    const json settled = nodeChangedEvent(entries.at(1));
+    LOGOS_ASSERT_EQ(accepted.at("phase").get<std::string>(), std::string("accepted"));
+    LOGOS_ASSERT_EQ(accepted.at("outcome").get<std::string>(), std::string("accepted"));
+    LOGOS_ASSERT_EQ(settled.at("phase").get<std::string>(), std::string("settled"));
+    LOGOS_ASSERT_EQ(settled.at("outcome").get<std::string>(), std::string("no_op"));
+    LOGOS_ASSERT_TRUE(settled.at("sequence").get<std::uint64_t>()
+                      > accepted.at("sequence").get<std::uint64_t>());
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("state").get<std::string>(),
+                    std::string("uninitialized"));
+    LOGOS_ASSERT_TRUE(settled.at("error").is_null());
+    LOGOS_ASSERT_EQ(lifecycleEventStatus(settled).at("last_completed_operation")
+                        .at("outcome").get<std::string>(),
+                    std::string("no_op"));
+}
+
+LOGOS_TEST(nodeAction_rejects_malformed_requests_without_dispatch) {
+    auto t = LogosTestContext("storage_module");
+    logos_test::EventCapture events;
+    StorageModuleImpl impl;
+
+    const json malformed = json::parse(impl.nodeAction("not-json"));
+    LOGOS_ASSERT_FALSE(malformed.at("accepted").get<bool>());
+    const json unsupported = invokeNodeAction(
+        impl, lifecycleCommand("unsupported-node-v1", "restart"));
+    LOGOS_ASSERT_FALSE(unsupported.at("accepted").get<bool>());
+    LOGOS_ASSERT_EQ(unsupported.at("error").at("code").get<std::string>(),
+                    std::string("invalid_request"));
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_new"), 0);
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_start"), 0);
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_stop"), 0);
+    LOGOS_ASSERT_EQ(t.cFunctionCallCount("storage_destroy"), 0);
+    LOGOS_ASSERT_TRUE(events.all("nodeChanged").empty());
 }
 
 // version

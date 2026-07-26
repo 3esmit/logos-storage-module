@@ -2,6 +2,12 @@
 
 Notable Storage Module package changes are recorded here.
 
+## [2.2.0] - Alpha
+
+### Added
+
+- Authoritative `lifecycleStatus()` state for host UIs to distinguish initialized, running, and pending Storage lifecycle states.
+
 ## [2.1.0] - Alpha
 
 ### Added

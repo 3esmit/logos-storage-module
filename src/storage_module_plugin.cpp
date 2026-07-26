@@ -171,6 +171,23 @@ static std::string fromMsg(const char* msg, size_t len) {
     return (msg && len > 0) ? std::string(msg, len) : std::string();
 }
 
+static constexpr std::uint8_t STORAGE_LIFECYCLE_NOT_INITIALIZED = 0;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_STOPPED = 1;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_STARTING = 2;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_RUNNING = 3;
+static constexpr std::uint8_t STORAGE_LIFECYCLE_STOPPING = 4;
+
+static const char* storageLifecycleStateName(std::uint8_t state) {
+    switch (state) {
+    case STORAGE_LIFECYCLE_NOT_INITIALIZED: return "not_initialized";
+    case STORAGE_LIFECYCLE_STOPPED: return "stopped";
+    case STORAGE_LIFECYCLE_STARTING: return "starting";
+    case STORAGE_LIFECYCLE_RUNNING: return "running";
+    case STORAGE_LIFECYCLE_STOPPING: return "stopping";
+    default: return "unknown";
+    }
+}
+
 static bool containsEmbeddedNul(const std::string& value) {
     return value.find('\0') != std::string::npos;
 }
@@ -576,11 +593,28 @@ static void emitSessionResult(StorageModuleImpl* impl, StorageEvent emit,
 struct SimpleEventCtx : AsyncCallbackBase {
     StorageModuleImpl* impl;
     StorageEvent event;
+    std::atomic<std::uint8_t>* lifecycleState;
+    std::atomic<std::uint64_t>* lifecycleGeneration;
+    std::uint64_t generation;
+    std::uint8_t successState;
+    std::uint8_t failureState;
 
-    SimpleEventCtx(StorageModuleImpl* i, StorageEvent ev)
-        : impl(i), event(ev) {}
+    SimpleEventCtx(StorageModuleImpl* i, StorageEvent ev,
+                   std::atomic<std::uint8_t>* state = nullptr,
+                   std::atomic<std::uint64_t>* generationCounter = nullptr,
+                   std::uint64_t operationGeneration = 0,
+                   std::uint8_t completedState = STORAGE_LIFECYCLE_NOT_INITIALIZED,
+                   std::uint8_t failedState = STORAGE_LIFECYCLE_NOT_INITIALIZED)
+        : impl(i), event(ev), lifecycleState(state),
+          lifecycleGeneration(generationCounter), generation(operationGeneration),
+          successState(completedState), failureState(failedState) {}
 
     void handleResponse(int ret, const char* msg, size_t len) override {
+        if (lifecycleState && lifecycleGeneration
+            && lifecycleGeneration->load() == generation) {
+            lifecycleState->store(
+                ret == RET_OK ? successState : failureState);
+        }
         emitBasicResponse(impl, event, ret, fromMsg(msg, len), "SimpleEventCtx");
     }
 };
@@ -1286,11 +1320,14 @@ static LegacyDownloadInitResult startLegacyDownloadInit(
 // ---------------------------------------------------------------------------
 
 StorageModuleImpl::StorageModuleImpl()
-    : storageCtx(nullptr), downloadRegistry(std::make_shared<DownloadRegistry>()) {
+    : storageCtx(nullptr), lifecycleState(STORAGE_LIFECYCLE_NOT_INITIALIZED),
+      lifecycleGeneration(0), downloadRegistry(std::make_shared<DownloadRegistry>()) {
     fprintf(stderr, "StorageModuleImpl: Initializing...\n");
 }
 
 StorageModuleImpl::~StorageModuleImpl() {
+    lifecycleGeneration.fetch_add(1);
+    lifecycleState.store(STORAGE_LIFECYCLE_NOT_INITIALIZED);
     cancelAndJoinDownloadV2Workers();
     if (storageCtx) {
         fprintf(stderr,
@@ -1320,8 +1357,11 @@ bool StorageModuleImpl::init(const std::string& cfg) {
         fprintf(stderr, "StorageModuleImpl::init failed: %s\n",
                 r.message.c_str());
         storageCtx = nullptr;
+        lifecycleState.store(STORAGE_LIFECYCLE_NOT_INITIALIZED);
         return false;
     }
+    lifecycleGeneration.fetch_add(1);
+    lifecycleState.store(STORAGE_LIFECYCLE_STOPPED);
     return true;
 }
 
@@ -1331,8 +1371,16 @@ bool StorageModuleImpl::start() {
         fprintf(stderr, "StorageModuleImpl::start: context not initialized\n");
         return false;
     }
-    auto* ctx = new SimpleEventCtx(this, &StorageModuleImpl::storageStart);
+    const std::uint8_t previousState = lifecycleState.load();
+    const std::uint64_t generation = lifecycleGeneration.fetch_add(1) + 1;
+    lifecycleState.store(STORAGE_LIFECYCLE_STARTING);
+    auto* ctx = new SimpleEventCtx(
+        this, &StorageModuleImpl::storageStart, &lifecycleState,
+        &lifecycleGeneration, generation, STORAGE_LIFECYCLE_RUNNING, previousState);
     if (storage_start(storageCtx, asyncCallback, ctx) != RET_OK) {
+        if (lifecycleGeneration.load() == generation) {
+            lifecycleState.store(previousState);
+        }
         delete ctx;
         return false;
     }
@@ -1343,8 +1391,16 @@ StdLogosResult StorageModuleImpl::stop() {
     fprintf(stderr, "StorageModuleImpl::stop called\n");
     if (!storageCtx)
         return {false, {}, "Storage context not initialized."};
-    auto* ctx = new SimpleEventCtx(this, &StorageModuleImpl::storageStop);
+    const std::uint8_t previousState = lifecycleState.load();
+    const std::uint64_t generation = lifecycleGeneration.fetch_add(1) + 1;
+    lifecycleState.store(STORAGE_LIFECYCLE_STOPPING);
+    auto* ctx = new SimpleEventCtx(
+        this, &StorageModuleImpl::storageStop, &lifecycleState,
+        &lifecycleGeneration, generation, STORAGE_LIFECYCLE_STOPPED, previousState);
     if (storage_stop(storageCtx, asyncCallback, ctx) != RET_OK) {
+        if (lifecycleGeneration.load() == generation) {
+            lifecycleState.store(previousState);
+        }
         delete ctx;
         return {false, {}, "Failed to send stop command."};
     }
@@ -1355,11 +1411,13 @@ StdLogosResult StorageModuleImpl::destroy() {
     fprintf(stderr, "StorageModuleImpl::destroy called\n");
     if (!storageCtx)
         return {false, {}, "Storage context not initialized."};
+    lifecycleGeneration.fetch_add(1);
     cancelAndJoinDownloadV2Workers();
     syncCallNoArg(storageCtx, storage_close, 1000);
     int ret = storage_destroy(storageCtx);
     if (ret == RET_OK) {
         storageCtx = nullptr;
+        lifecycleState.store(STORAGE_LIFECYCLE_NOT_INITIALIZED);
         return {true, {}, ""};
     }
     return {false, {}, "Failed to destroy storage context."};
@@ -1381,6 +1439,15 @@ StdLogosResult StorageModuleImpl::version() {
 
 std::string StorageModuleImpl::moduleVersion() {
     return STORAGE_MODULE_VERSION;
+}
+
+LogosMap StorageModuleImpl::lifecycleStatus() {
+    const std::uint8_t state = lifecycleState.load();
+    return {
+        {"initialized", state != STORAGE_LIFECYCLE_NOT_INITIALIZED},
+        {"running", state == STORAGE_LIFECYCLE_RUNNING},
+        {"state", storageLifecycleStateName(state)},
+    };
 }
 
 StdLogosResult StorageModuleImpl::dataDir() {

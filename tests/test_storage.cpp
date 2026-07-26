@@ -25,6 +25,13 @@ static StorageModuleImpl* createInitializedImpl(LogosTestContext& t) {
     return impl;
 }
 
+static void assertLifecycleStatus(const LogosMap& status, bool initialized,
+                                  bool running, const char* state) {
+    LOGOS_ASSERT_EQ(status.at("initialized").get<bool>(), initialized);
+    LOGOS_ASSERT_EQ(status.at("running").get<bool>(), running);
+    LOGOS_ASSERT_EQ(status.at("state").get<std::string>(), std::string(state));
+}
+
 static std::vector<logos_test::EventCapture::Entry> waitForEventCount(
     logos_test::EventCapture& events, const std::string& name, size_t count,
     int timeoutMs) {
@@ -55,6 +62,63 @@ LOGOS_TEST(init_fails_when_storage_new_returns_null) {
 
     StorageModuleImpl impl;
     LOGOS_ASSERT_FALSE(impl.init("{\"data-dir\":\"/tmp/test\"}"));
+}
+
+LOGOS_TEST(lifecycleStatus_tracks_module_owned_lifecycle) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    assertLifecycleStatus(impl.lifecycleStatus(), false, false, "not_initialized");
+
+    t.mockCFunction("storage_new").returns(1);
+    LOGOS_ASSERT_TRUE(impl.init("{\"data-dir\":\"/tmp/test\"}"));
+    assertLifecycleStatus(impl.lifecycleStatus(), true, false, "stopped");
+
+    mockStorageHoldNextStart();
+    LOGOS_ASSERT_TRUE(impl.start());
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStart(1000));
+    assertLifecycleStatus(impl.lifecycleStatus(), true, false, "starting");
+    mockStorageCompleteHeldStart(RET_OK, "started");
+    assertLifecycleStatus(impl.lifecycleStatus(), true, true, "running");
+
+    mockStorageHoldNextStop();
+    LOGOS_ASSERT_TRUE(impl.stop().success);
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStop(1000));
+    assertLifecycleStatus(impl.lifecycleStatus(), true, false, "stopping");
+    mockStorageCompleteHeldStop(RET_ERR, "stop failed");
+    assertLifecycleStatus(impl.lifecycleStatus(), true, true, "running");
+
+    mockStorageHoldNextStop();
+    LOGOS_ASSERT_TRUE(impl.stop().success);
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStop(1000));
+    mockStorageCompleteHeldStop(RET_OK, "stopped");
+    assertLifecycleStatus(impl.lifecycleStatus(), true, false, "stopped");
+
+    LOGOS_ASSERT_TRUE(impl.destroy().success);
+    assertLifecycleStatus(impl.lifecycleStatus(), false, false, "not_initialized");
+}
+
+LOGOS_TEST(lifecycleStatus_ignores_stale_terminal_callback) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+
+    mockStorageHoldNextStart();
+    LOGOS_ASSERT_TRUE(impl->start());
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStart(1000));
+    assertLifecycleStatus(impl->lifecycleStatus(), true, false, "starting");
+
+    mockStorageHoldNextStop();
+    LOGOS_ASSERT_TRUE(impl->stop().success);
+    LOGOS_ASSERT_TRUE(mockStorageWaitForHeldStop(1000));
+    assertLifecycleStatus(impl->lifecycleStatus(), true, false, "stopping");
+    mockStorageCompleteHeldStop(RET_OK, "stopped");
+    assertLifecycleStatus(impl->lifecycleStatus(), true, false, "stopped");
+
+    mockStorageCompleteHeldStart(RET_OK, "late start");
+    assertLifecycleStatus(impl->lifecycleStatus(), true, false, "stopped");
+
+    LOGOS_ASSERT_TRUE(impl->destroy().success);
+    delete impl;
 }
 
 // version

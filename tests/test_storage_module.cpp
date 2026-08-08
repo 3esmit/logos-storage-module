@@ -180,7 +180,7 @@ static void ensureRestarted(const json& extraConfig = json::object()) {
     json cfg = {
         {"data-dir", g_dataDir.string()},
         {"log-level", "DEBUG"},
-        {"nat", "none"},
+        {"nat", "auto"},
         {"log-file", logFile},
     };
     cfg.update(extraConfig);
@@ -285,7 +285,7 @@ LOGOS_TEST(init_multiple_times) {
     json cfg = {
         {"data-dir", g_dataDir},
         {"log-level", "DEBUG"},
-        {"nat", "none"},
+        {"nat", "auto"},
     };
 
     std::string config = cfg.dump();
@@ -348,6 +348,7 @@ LOGOS_TEST(integration_debug) {
     LOGOS_ASSERT_FALSE(r.value.empty());
     LOGOS_ASSERT_TRUE(r.value.contains("id"));
     LOGOS_ASSERT_TRUE(r.value.contains("addrs"));
+    LOGOS_ASSERT_TRUE(r.value.contains("providerAddresses"));
     LOGOS_ASSERT_TRUE(r.value.contains("announceAddresses"));
     LOGOS_ASSERT_TRUE(r.value.contains("table"));
 }

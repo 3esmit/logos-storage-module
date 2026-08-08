@@ -127,7 +127,7 @@ Example:
      "storage-quota": 21474836480,
      "listen-port": 0,
      "disc-port": 8090,
-     "nat": "any",
+     "nat": "auto",
      "network": "logos.test",
      "mix-enabled": false
    }
@@ -189,18 +189,9 @@ internet:
 
    * - Value
      - When to use it
-   * - ``any``
-     - Default. Tries the methods below automatically.
-   * - ``none``
-     - No NAT traversal: the node announces the machine's own IP as-is. Use
-       this when the machine already has a public IP (e.g. a cloud server or
-       VPS). With only a private IP, the node stays unreachable.
-   * - ``upnp``
-     - If your router has UPnP enabled, the node asks it to open a port so
-       you become reachable from the internet.
-   * - ``pmp``
-     - Same as ``upnp``, but using NAT-PMP. Use it when your router supports
-       NAT-PMP instead.
+   * - ``auto``
+     - Use the supported automatic reachability strategy. This is the default
+       for local and test configurations.
    * - ``extip:<IP>``
      - Set your public IP yourself, e.g. ``extip:203.0.113.7``. Use this when
        you know your public IP and have opened your listen port on the router

@@ -50,7 +50,7 @@ public:
     ///     "data-dir": ".cache/storage",
     ///     "listen-ip": "0.0.0.0",
     ///     "listen-port": 0,
-    ///     "nat": "any",
+    ///     "nat": "auto",
     ///     "disc-port": 8090,
     ///     "net-privkey": "key",
     ///     "bootstrap-node": [],

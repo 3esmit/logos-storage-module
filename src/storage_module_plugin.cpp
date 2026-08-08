@@ -2380,7 +2380,7 @@ LogosMap StorageModuleImpl::downloadProtocol() {
 
 StdLogosResult StorageModuleImpl::downloadToUrlV2(
     const std::string& cid, const std::string& filePath, bool local,
-    int chunkSize, const std::string& operationId, int maxDownloadBytes) {
+    int64_t chunkSize, const std::string& operationId, int64_t maxDownloadBytes) {
     reapFinishedDownloadV2Workers();
     if (!storageCtx) {
         return {false, {}, "Storage context not initialized."};
@@ -2393,7 +2393,7 @@ StdLogosResult StorageModuleImpl::downloadToUrlV2(
         || chunkSize > MAX_DOWNLOAD_V2_CHUNK_BYTES) {
         return {false, {}, "Invalid versioned download arguments."};
     }
-    const int effectiveChunkSize = std::min(chunkSize, maxDownloadBytes);
+    const int64_t effectiveChunkSize = std::min(chunkSize, maxDownloadBytes);
 
     std::string reserveError;
     const auto lease = reserveDownloadLease(downloadRegistry, cid, DownloadOwner::Versioned,
@@ -2594,7 +2594,7 @@ StdLogosResult StorageModuleImpl::downloadCancelV2(const std::string& operationI
 
 void StorageModuleImpl::runDownloadV2(
     const std::shared_ptr<DownloadV2State>& state, const std::string& stagingPath,
-    const std::string& destinationPath, int chunkSize, uint64_t expectedBytes,
+    const std::string& destinationPath, int64_t chunkSize, uint64_t expectedBytes,
     uint64_t maxBytes) {
     auto removePartialFile = [&stagingPath] {
         std::error_code ec;

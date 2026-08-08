@@ -50,7 +50,7 @@ public:
     ///     "data-dir": ".cache/storage",
     ///     "listen-ip": "0.0.0.0",
     ///     "listen-port": 0,
-    ///     "nat": "any",
+    ///     "nat": "auto",
     ///     "disc-port": 8090,
     ///     "net-privkey": "key",
     ///     "bootstrap-node": [],
@@ -171,7 +171,9 @@ public:
     ///   "id": string,
     ///   "addrs": [string],
     ///   "spr": string,
-    ///   "announceAddresses": [string],
+    ///   "providerAddresses": [string],
+    ///   "discoveryAddresses": [string],
+    ///   "announceAddresses": [string], // compatibility alias of providerAddresses
     ///   "table": {
     ///     "localNode": { "nodeId": string, "peerId": string,
     ///                    "record": string, "address": string, "seen": bool },

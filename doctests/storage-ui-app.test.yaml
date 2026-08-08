@@ -231,7 +231,7 @@ sections:
                   "log-level": "DEBUG",
                   "listen-port": 8500,
                   "disc-port": 8090,
-                  "nat": "none",
+                  "nat": "auto",
                   "network": "logos.dev",
                   "mix-enabled": true,
                   "dht-mix-proxy": [

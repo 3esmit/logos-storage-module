@@ -2121,7 +2121,17 @@ StdLogosResult StorageModuleImpl::debug() {
     auto r = syncCallNoArg(storageCtx, storage_debug, 1000);
     if (!r.ok) return {false, {}, r.message};
     try {
-        return {true, json::parse(r.message), ""};
+        auto parsed = json::parse(r.message);
+        // libstorage v0.4.2 renamed the provider-record field to
+        // `providerAddresses`. Keep the module's established
+        // `announceAddresses` contract for existing Inspector consumers.
+        if (parsed.is_object() && !parsed.contains("announceAddresses")) {
+            const auto providerAddresses = parsed.find("providerAddresses");
+            if (providerAddresses != parsed.end() && providerAddresses->is_array()) {
+                parsed["announceAddresses"] = *providerAddresses;
+            }
+        }
+        return {true, std::move(parsed), ""};
     } catch (...) {
         return {false, {}, "Failed to parse debug info."};
     }

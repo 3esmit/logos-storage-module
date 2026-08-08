@@ -61,7 +61,7 @@ cat > config.json <<'EOF'
 {
   "data-dir": "./storage-data",
   "log-level": "DEBUG",
-  "nat": "any",
+  "nat": "auto",
   "network": "logos.test"
 }
 EOF
@@ -70,7 +70,9 @@ EOF
 Notes:
 
 - `data-dir` is where the storage node stores its local repo.
-- `nat: none` is useful for a simple local run, but if the node only has private/local addresses, libstorage may warn that the node is only reachable on a private network. That warning does not prevent the local demo from working.
+- `nat: auto` is the supported local setting. It lets libstorage select the
+  available transport behavior while keeping the example valid on current
+  releases.
 
 ## 7. Start the daemon in Terminal 1
 
@@ -172,14 +174,10 @@ Expected successful signs:
 - The daemon terminal shows upload progress and `storageUploadDone` events after `importFiles`.
 - The `manifests` call returns entries for the imported files.
 
-With the example `nat: none` config, the daemon may print warnings such as:
-
-```text
-Bind IP is not a public IP address. Should not use --nat:none option
-Unable to determine a public IP address. This node will only be reachable on a private network.
-```
-
-Those warnings are expected for a simple local/private-network run and do not prevent the demo from completing.
+The example uses `nat: auto`, so startup does not rely on the removed `none`
+strategy. If the host cannot establish public reachability, libstorage may
+still report that the node is private or relay-only; that is expected for a
+local demo and does not prevent the storage calls from completing.
 
 The helper script stops the daemon at the end with:
 

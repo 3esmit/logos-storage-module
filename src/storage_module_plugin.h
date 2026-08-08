@@ -383,9 +383,9 @@ public:
     StdLogosResult downloadToUrlV2(const std::string& cid,
                                    const std::string& filePath,
                                    bool local,
-                                   int chunkSize,
+                                   int64_t chunkSize,
                                    const std::string& operationId,
-                                   int maxDownloadBytes);
+                                   int64_t maxDownloadBytes);
 
     /// Request cancellation of a versioned download by caller operation ID.
     ///
@@ -647,7 +647,7 @@ private:
 
     void runDownloadV2(const std::shared_ptr<DownloadV2State>& state,
                        const std::string& stagingPath,
-                       const std::string& destinationPath, int chunkSize,
+                       const std::string& destinationPath, int64_t chunkSize,
                        uint64_t expectedBytes, uint64_t maxBytes);
     void finishDownloadV2(const std::shared_ptr<DownloadV2State>& state,
                           const std::string& outcome,

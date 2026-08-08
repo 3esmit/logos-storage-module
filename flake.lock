@@ -12238,20 +12238,20 @@
         "nixpkgs": "nixpkgs_296"
       },
       "locked": {
-        "lastModified": 1782923076,
-        "narHash": "sha256-gzuyHsiZciyiXyT+xUajxj7KIrHru7c2A9l2aLroGIQ=",
-        "ref": "refs/tags/v0.4.1",
-        "rev": "d94417a221ea12153c70744cb22942a561ab2a34",
-        "revCount": 949,
+        "lastModified": 1786027650,
+        "narHash": "sha256-HCL99IHNJnNhSRQrm+GhF+0LaMgzLykKcKnNbwHHWiw=",
+        "ref": "refs/heads/master",
+        "rev": "d95235593b7bab979805beb1430ad45d7306d093",
+        "revCount": 965,
         "submodules": true,
         "type": "git",
-        "url": "https://github.com/logos-storage/logos-storage-nim"
+        "url": "https://github.com/3esmit/logos-storage-nim"
       },
       "original": {
-        "ref": "refs/tags/v0.4.1",
+        "rev": "d95235593b7bab979805beb1430ad45d7306d093",
         "submodules": true,
         "type": "git",
-        "url": "https://github.com/logos-storage/logos-storage-nim"
+        "url": "https://github.com/3esmit/logos-storage-nim"
       }
     },
     "logos-test-framework": {
@@ -19118,17 +19118,17 @@
     },
     "nixpkgs_296": {
       "locked": {
-        "lastModified": 1751274312,
-        "narHash": "sha256-/bVBlRpECLVzjV19t5KMdMFWSwKLtb5RyXdjz3LJT+g=",
+        "lastModified": 1780511130,
+        "narHash": "sha256-2v9lT4ya59Lh1FqPeLnz1MoX9y/wz2huqfe9RtQZITk=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "50ab793786d9de88ee30ec4e4c24fb4236fc2674",
+        "rev": "535f3e6942cb1cead3929c604320d3db54b542b9",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "nixos-24.11",
         "repo": "nixpkgs",
+        "rev": "535f3e6942cb1cead3929c604320d3db54b542b9",
         "type": "github"
       }
     },

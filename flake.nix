@@ -2,7 +2,7 @@
   description = "Logos Storage Module";
 
   inputs = {
-    logos-module-builder.url = "github:3esmit/logos-module-builder?rev=324b459c3f7b59171d249f3ccbcc362403b3fcaf";
+    logos-module-builder.url = "github:3esmit/logos-module-builder?rev=1afad1253b57a8c1848ae6dc955dcab477b3b4c3";
     logos-storage.url = "git+https://github.com/3esmit/logos-storage-nim?submodules=1&rev=d95235593b7bab979805beb1430ad45d7306d093";
   };
 

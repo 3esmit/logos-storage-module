@@ -285,7 +285,7 @@ LOGOS_TEST(init_multiple_times) {
     json cfg = {
         {"data-dir", g_dataDir},
         {"log-level", "DEBUG"},
-        {"nat", "auto"},
+       {"nat", "auto"},
     };
 
     std::string config = cfg.dump();

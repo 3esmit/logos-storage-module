@@ -28965,17 +28965,17 @@
         "nixpkgs": "nixpkgs_642"
       },
       "locked": {
-        "lastModified": 1786027650,
-        "narHash": "sha256-HCL99IHNJnNhSRQrm+GhF+0LaMgzLykKcKnNbwHHWiw=",
+        "lastModified": 1786631625,
+        "narHash": "sha256-rHU47eKnszGP/0L1grCCH9ZVsxsd6miO0AW0VWzfwwk=",
         "ref": "refs/heads/master",
-        "rev": "d95235593b7bab979805beb1430ad45d7306d093",
-        "revCount": 965,
+        "rev": "523c7a51ebb85d7f7dde1b53444a8766d39b798f",
+        "revCount": 974,
         "submodules": true,
         "type": "git",
         "url": "https://github.com/3esmit/logos-storage-nim"
       },
       "original": {
-        "rev": "d95235593b7bab979805beb1430ad45d7306d093",
+        "rev": "523c7a51ebb85d7f7dde1b53444a8766d39b798f",
         "submodules": true,
         "type": "git",
         "url": "https://github.com/3esmit/logos-storage-nim"

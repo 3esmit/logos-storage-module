@@ -32,21 +32,10 @@
       nixpkgs = logos-module-builder.inputs.nixpkgs;
       lib = nixpkgs.lib;
 
-      # The builder's own list, so this flake gains a target the moment the
-      # builder does. It is currently the four native systems plus the
-      # "x86_64-windows" pseudo-system (a mingw cross build, whose derivations
-      # carry system = x86_64-linux and so realise on an ordinary Linux
-      # builder). Hard-coding the list here is what kept this module off
-      # Windows while every module that returns mkLogosModule directly gained
-      # it for free.
+      # Native systems plus the "x86_64-windows" cross target.
       systems = logos-module-builder.lib.common.systems;
 
-      # The test plumbing below is native-only, for two independent reasons:
-      # `import nixpkgs { system = "x86_64-windows"; }` yields a NATIVE Windows
-      # package set (it does not throw -- it produces something unusable, and
-      # the first symptom is a misleading failure inside writeShellScript), and
-      # a runner that executes ${unitTests}/bin/* would be running PEs on the
-      # Linux builder regardless.
+      # No tests for x86_64-windows: its Windows binaries cannot run on the Linux builder.
       nativeSystems = builtins.filter (s: s != "x86_64-windows") systems;
 
       # Provide a custom tests package to build tests without in-build execution.

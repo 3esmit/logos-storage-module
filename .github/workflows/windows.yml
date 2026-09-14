@@ -1,6 +1,6 @@
 name: Windows (nix cross)
 
-# Cross-compiled Windows .lgx is built via logos-windows-ci.
+# Cross-compiled Windows plugin and .lgx are built via logos-windows-ci.
 # We use a smoke test to verify the archive content.
 
 on:
@@ -19,8 +19,7 @@ jobs:
     secrets: inherit
     with:
       timeout-minutes: 120
-      targets: lgx-portable
-      # The DLLs are inside the .lgx archive: lgx-variant checks them.
-      min-pes: 0
+      # `default` is checked for missing DLLs: the portable .lgx omits the ones Basecamp provides.
+      targets: default lgx-portable
       lgx-variant: true
       smoke-file: .github/smoke/storage-module-lgx.sh

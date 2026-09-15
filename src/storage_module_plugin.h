@@ -171,7 +171,7 @@ public:
     ///   "spr": string,
     ///   "table": {
     ///     "localNode": { "peerId": string, "addresses": [string],
-    ///                    "lastSeen": int },
+    ///                    "lastSeen": null },
     ///     "nodes": [{ "peerId": string, "addresses": [string],
     ///                 "lastSeen": int }]
     ///   }

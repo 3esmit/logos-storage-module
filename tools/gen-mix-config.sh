@@ -4,11 +4,14 @@
 # CI only checks that the committed file still matches the live data.
 set -euo pipefail
 
-STORAGE_CONFIG_URL="${STORAGE_CONFIG_URL:-https://raw.githubusercontent.com/logos-storage/logos-storage-nim/v0.4.5/tools/scripts/storage-config.sh}"
+root=$(cd "$(dirname "$0")/.." && pwd)
 
+# Take the revision from the flake.lock file.
+rev=$(jq -r '.nodes["logos-storage"].locked.rev' "$root/flake.lock")
+
+STORAGE_CONFIG_URL="${STORAGE_CONFIG_URL:-https://raw.githubusercontent.com/logos-storage/logos-storage-nim/${rev}/tools/scripts/storage-config.sh}"
 NETWORKS=(test dev)
 
-root=$(cd "$(dirname "$0")/.." && pwd)
 script=$(mktemp)
 trap 'rm -f "$script"' EXIT
 

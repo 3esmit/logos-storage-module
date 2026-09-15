@@ -172,7 +172,7 @@ The file is generated:
 ```
 
 It fetches the data from `fleets.logos.co`, through the `storage-config.sh`
-script of `logos-storage-nim`.
+script of `logos-storage-nim` at the revision pinned in `flake.lock`.
 
 The `mix-config.json` CI workflow regenerates it on every PR and fails when the
 committed Mix config no longer matches the live one.

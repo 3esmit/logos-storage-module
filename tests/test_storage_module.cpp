@@ -646,3 +646,25 @@ LOGOS_TEST(integration_togglePrivateQueries_withMixEnabled) {
     LOGOS_ASSERT_TRUE(on.success);
     LOGOS_ASSERT_FALSE(on.value.get<bool>());
 }
+
+LOGOS_TEST(integration_init_accepts_a_migrated_config) {
+    fs::path dataDir = fs::temp_directory_path() /
+                       ("logos-storage-integration-test-" +
+                        std::to_string(
+                            std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    g_impl = new StorageModuleImpl();
+    g_waiter.install(g_impl);
+
+    const StdLogosResult migrated =
+        g_impl->migrateConfig(json{{"data-dir", dataDir.string()},
+                                   {"nat", "extip:127.0.0.1"}}.dump());
+
+    LOGOS_ASSERT_TRUE(migrated.success);
+    LOGOS_ASSERT_TRUE(json::parse(migrated.value.get<std::string>()).contains("config-version"));
+    LOGOS_ASSERT_TRUE(g_impl->init(migrated.value.get<std::string>()));
+
+    g_impl->destroy();
+    delete g_impl;
+    g_impl = nullptr;
+}

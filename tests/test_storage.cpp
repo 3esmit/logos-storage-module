@@ -178,7 +178,7 @@ LOGOS_TEST(debug_returns_parsed_map) {
     auto* impl = createInitializedImpl(t);
 
     t.mockCFunction("storage_debug")
-        .returns(R"({"id":"QmNode","addrs":[],"providerAddresses":[],"table":{}})");
+        .returns(R"({"id":"QmNode","addrs":[],"spr":"spr:AAAA","table":{}})");
     StdLogosResult r = impl->debug();
 
     LOGOS_ASSERT_TRUE(r.success);
@@ -654,14 +654,14 @@ LOGOS_TEST(migrateConfig_stamps_the_schema_version) {
     auto t = LogosTestContext("storage_module");
     StorageModuleImpl impl;
 
-    LOGOS_ASSERT_EQ(migrated(impl, json::object())["config-version"].get<int>(), 2);
+    LOGOS_ASSERT_EQ(migrated(impl, json::object())["config-version"].get<int>(), 3);
 }
 
 LOGOS_TEST(migrateConfig_leaves_a_current_config_alone) {
     auto t = LogosTestContext("storage_module");
     StorageModuleImpl impl;
 
-    const json out = migrated(impl, json{{"config-version", 2}, {"nat", "extip:1.2.3.4"}});
+    const json out = migrated(impl, json{{"config-version", 3}, {"nat", "extip:1.2.3.4"}});
 
     LOGOS_ASSERT_EQ(out["nat"].get<std::string>(), std::string("extip:1.2.3.4"));
 }
@@ -747,6 +747,15 @@ LOGOS_TEST(migrateConfig_keeps_a_valid_nat) {
                     std::string("extip:1.2.3.4"));
 }
 
+LOGOS_TEST(migrateConfig_drops_the_disc_port) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"config-version", 2}, {"disc-port", 8090}});
+
+    LOGOS_ASSERT_FALSE(out.contains("disc-port"));
+}
+
 LOGOS_TEST(migrateConfig_fills_the_mix_configuration_of_the_network) {
     auto t = LogosTestContext("storage_module");
     StorageModuleImpl impl;
@@ -770,7 +779,7 @@ LOGOS_TEST(migrateConfig_leaves_mix_alone_when_mix_is_off) {
     auto t = LogosTestContext("storage_module");
     StorageModuleImpl impl;
 
-    const json out = migrated(impl, json{{"config-version", 2}, {"mix-enabled", false}});
+    const json out = migrated(impl, json{{"config-version", 3}, {"mix-enabled", false}});
 
     LOGOS_ASSERT_FALSE(out.contains("dht-mix-proxy"));
 }
@@ -818,7 +827,7 @@ LOGOS_TEST(migrateConfig_reports_a_mistyped_mix_enabled) {
     StorageModuleImpl impl;
 
     StdLogosResult r =
-        impl.migrateConfig(json{{"config-version", 2}, {"mix-enabled", "yes"}}.dump());
+        impl.migrateConfig(json{{"config-version", 3}, {"mix-enabled", "yes"}}.dump());
 
     LOGOS_ASSERT_FALSE(r.success);
 }

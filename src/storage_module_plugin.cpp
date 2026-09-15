@@ -685,7 +685,7 @@ json migrateV1toV2(json obj) {
     return obj;
 }
 
-json migrateConfig(json obj) {
+json migrateConfigVersion(json obj) {
     const int version = obj.value("config-version", 0);
 
     if (version >= configVersion) {
@@ -734,7 +734,7 @@ json syncMixConfig(json obj) {
 
 }
 
-StdLogosResult StorageModuleImpl::refreshConfig(const std::string& cfg) {
+StdLogosResult StorageModuleImpl::migrateConfig(const std::string& cfg) {
     try {
         json config = cfg.empty() ? json::object() : json::parse(cfg);
 
@@ -742,7 +742,7 @@ StdLogosResult StorageModuleImpl::refreshConfig(const std::string& cfg) {
             return {false, {}, "Invalid configuration: expected a JSON object."};
         }
 
-        config = syncMixConfig(migrateConfig(config));
+        config = syncMixConfig(migrateConfigVersion(config));
 
         if (!config.contains("data-dir")) {
             // logos-storage-nim's own default differs per platform. One path keeps

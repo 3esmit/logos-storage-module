@@ -25,7 +25,7 @@ public:
     StorageModuleImpl();
     ~StorageModuleImpl();
 
-    /// Refresh the configuration after a Storage Module update.
+    /// Migrate the configuration after a Storage Module update.
     ///
     /// This method takes a configuration string in parameters and returns
     /// a new configuration JSON string updated.
@@ -36,13 +36,13 @@ public:
     ///
     /// In addition to the migration, the data-dir is also set if it is not provided
     /// in configuration. And with `mix-enabled` true plus a network key, the mix
-    /// configuration is refreshed.
+    /// configuration is updated.
     ///
     /// This method should be called before `init()`. It is a separate step so
     /// the caller can get the result of the new configuration and update it.
     ///
     /// Returns StdLogosResult::value as the JSON to hand to init().
-    StdLogosResult refreshConfig(const std::string& cfg);
+    StdLogosResult migrateConfig(const std::string& cfg);
 
     /// Create a new storage node instance and configure it.
     ///

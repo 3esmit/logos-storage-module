@@ -60,7 +60,7 @@ In a nutshell, to share a file on the Logos Storage network, you need to:
 
 The key portions of the :doc:`module API<api_reference>` involved in a publishing/downloading flow are:
 
-1. ``refreshConfig`` -- bring a stored configuration up to date with this build.
+1. ``migrateConfig`` -- bring a stored configuration up to date with this build.
 2. ``init`` -- initialize the node and read its JSON configuration file.
 3. ``start`` -- start the node and join the network.
 4. ``uploadUrl`` / ``downloadToUrl`` -- send and receive files.
@@ -77,7 +77,7 @@ Configuration
 You configure a node by passing a JSON string to ``init``. Every key is
 optional: any key you leave out keeps its default value.
 
-``refreshConfig`` should be called before ``init`` to ensure that the
+``migrateConfig`` should be called before ``init`` to ensure that the
 configuration is up to date with the version of the storage module you are using.
 It returns the updated configuration and writes nothing.
 
@@ -321,7 +321,7 @@ Example:
 ``mix-enabled`` is set to ``true`` automatically on the latest version unless it is explicitly disabled or
 a custom bootstrap node list is used.
 
-The Mix configuration is refreshed when calling ``refreshConfig`` if the bootstrap
+The Mix configuration is updated when calling ``migrateConfig`` if the bootstrap
 node list is empty, Mix is enabled and the network matches an existing pre-configured network.
 
 When Mix is configured (``mix-enabled`` true and at least one ``dht-mix-proxy`` set), the

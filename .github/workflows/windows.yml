@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   windows:
-    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@b154b108f97f13b796fbf56b23911dbe89c33e2e
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml
     secrets: inherit
     with:
       timeout-minutes: 120

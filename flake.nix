@@ -30,7 +30,13 @@
       };
 
       nixpkgs = logos-module-builder.inputs.nixpkgs;
-      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
+      lib = nixpkgs.lib;
+
+      # Native systems plus the "x86_64-windows" cross target.
+      systems = logos-module-builder.lib.common.systems;
+
+      # No tests for x86_64-windows: its Windows binaries cannot run on the Linux builder.
+      nativeSystems = builtins.filter (s: s != "x86_64-windows") systems;
 
       # Provide a custom tests package to build tests without in-build execution.
       testsPackage = system:
@@ -63,7 +69,7 @@
           name = system;
           value = { tests = { type = "app"; program = toString runner; }; };
         }
-      ) systems);
+      ) nativeSystems);
 
       existingApps = module.apps or {};
       mergedApps = builtins.listToAttrs (map (system: {
@@ -75,9 +81,10 @@
       # produces result/bin/{storage_module_tests,storage_module_integration_tests}.
       mergedPackages = builtins.listToAttrs (map (system: {
         name = system;
-        value = (module.packages.${system} or {}) // {
-          tests = testsPackage system;
-        };
+        value = (module.packages.${system} or {})
+          // lib.optionalAttrs (builtins.elem system nativeSystems) {
+               tests = testsPackage system;
+             };
       }) systems);
 
     in module // { apps = mergedApps; packages = mergedPackages; };

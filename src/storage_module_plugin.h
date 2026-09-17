@@ -35,6 +35,25 @@ public:
     StorageModuleImpl();
     ~StorageModuleImpl();
 
+    /// Migrate the configuration after a Storage Module update.
+    ///
+    /// This method takes a configuration string in parameters and returns
+    /// a new configuration JSON string updated.
+    ///
+    /// Depending on the updates of logos-storage-nim, some options can be removed
+    /// or replaced with new ones. This method ensures a migration path for the
+    /// configuration to the latest version of the module using a configuration version.
+    ///
+    /// In addition to the migration, the data-dir is also set if it is not provided
+    /// in configuration. And with `mix-enabled` true plus a network key, the mix
+    /// configuration is updated.
+    ///
+    /// This method should be called before `init()`. It is a separate step so
+    /// the caller can get the result of the new configuration and update it.
+    ///
+    /// Returns StdLogosResult::value as the JSON to hand to init().
+    StdLogosResult migrateConfig(const std::string& cfg);
+
     /// Create a new storage node instance and configure it.
     ///
     /// `cfg` is a JSON string with the configuration overwriting defaults.
@@ -51,7 +70,6 @@ public:
     ///     "listen-ip": "0.0.0.0",
     ///     "listen-port": 0,
     ///     "nat": "auto",
-    ///     "disc-port": 8090,
     ///     "net-privkey": "key",
     ///     "bootstrap-node": [],
     ///     "no-bootstrap-node": false,
@@ -116,11 +134,16 @@ public:
 
     /// Get the libstorage version string.
     ///
+    /// Named for what it returns: this is the version of the underlying
+    /// libstorage (Nim) library, NOT of this module. `version()` cannot be used
+    /// for it -- that name is reserved for module identity and must be
+    /// `version() -> tstr`, which the generator injects from `metadata.json`.
+    ///
     /// Does not require the node to be started.
     ///
     /// Returns StdLogosResult::value as a std::string on success.
     /// The method is synchronous.
-    StdLogosResult version();
+    StdLogosResult libstorageVersion();
 
     /// Get this module's version, as declared in `metadata.json`.
     ///
@@ -157,6 +180,12 @@ public:
     /// The method is synchronous.
     StdLogosResult dataDir();
 
+    /// Get the Logos network this node was configured for.
+    ///
+    /// Returns StdLogosResult::value as a std::string on success.
+    /// The method is synchronous.
+    StdLogosResult network();
+
     /// Get the node's peer ID.
     ///
     /// The peer ID is the libp2p peer identity as described at
@@ -180,14 +209,14 @@ public:
     ///   "id": string,
     ///   "addrs": [string],
     ///   "spr": string,
-    ///   "providerAddresses": [string],
-   ///   "discoveryAddresses": [string],
-   ///   "announceAddresses": [string], // compatibility alias of providerAddresses
+    ///   "providerAddresses": [string], // empty when unavailable from libstorage
+    ///   "discoveryAddresses": [string], // empty when unavailable from libstorage
+    ///   "announceAddresses": [string], // compatibility alias of providerAddresses
     ///   "table": {
-    ///     "localNode": { "nodeId": string, "peerId": string,
-    ///                    "record": string, "address": string, "seen": bool },
-    ///     "nodes": [{ "nodeId": string, "peerId": string,
-    ///                 "record": string, "address": string, "seen": bool }]
+    ///     "localNode": { "peerId": string, "addresses": [string],
+    ///                    "lastSeen": null },
+    ///     "nodes": [{ "peerId": string, "addresses": [string],
+    ///                 "lastSeen": int }]
     ///   }
     /// }
     /// @endcode
@@ -522,6 +551,7 @@ logos_events:
     ///   "success":   bool,
     ///   "sessionId": string,
     ///   "bytes":     number,       // present on success
+    ///   "total":     number,       // file size in bytes
     ///   "error":     string        // present on failure
     /// }
     /// @endcode
@@ -544,6 +574,7 @@ logos_events:
     ///   "success":   true,
     ///   "sessionId": string,
     ///   "bytes":     number,       // file download (downloadToUrl)
+    ///   "total":     number,       // file download; dataset size in bytes
     ///   "chunk":     string        // base64 chunk, stream download (downloadChunks)
     /// }
     /// @endcode

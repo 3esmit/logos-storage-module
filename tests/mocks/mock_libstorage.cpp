@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #define RET_OK 0
 #define RET_ERR 1
@@ -376,6 +377,12 @@ int storage_spr(void* ctx, StorageCallback cb, void* userData) {
     return RET_OK;
 }
 
+int storage_network(void* ctx, StorageCallback cb, void* userData) {
+    LOGOS_CMOCK_RECORD("storage_network");
+    invokeOk("storage_network", cb, userData);
+    return RET_OK;
+}
+
 int storage_debug(void* ctx, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_debug");
     invokeOk("storage_debug", cb, userData);
@@ -567,6 +574,8 @@ int storage_download_stream(void* ctx, const char* cid, size_t chunkSize, bool l
         invokeError(cb, userData, "forced stream dispatch failure");
         return rc;
     }
+    std::vector<char> block(chunkSize, 0);
+    if (cb) cb(RET_PROGRESS, block.data(), block.size(), userData);
     invokeOk("storage_download_stream", cb, userData);
     return rc;
 }

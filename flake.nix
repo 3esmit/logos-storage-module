@@ -1,9 +1,15 @@
 {
   description = "Logos Storage Module";
 
+  # Pull pre-built artifacts from the self-hosted Logos Attic cache(Nix binary cache).
+  nixConfig = {
+    extra-substituters = [ "https://cache.nix.logos.co/public" ];
+    extra-trusted-public-keys = [ "public:l4HrXgL4nw246+LBh2SOJyhz64BoGegOYLheT/iIAPU=" ];
+  };
+
   inputs = {
     logos-module-builder.url = "github:3esmit/logos-module-builder?rev=1afad1253b57a8c1848ae6dc955dcab477b3b4c3";
-    logos-storage.url = "git+https://github.com/3esmit/logos-storage-nim?submodules=1&rev=523c7a51ebb85d7f7dde1b53444a8766d39b798f";
+    logos-storage.url = "git+https://github.com/3esmit/logos-storage-nim?submodules=1&rev=21a00ace2e03811c9bf4dfc9ba4688ad6e1cbd00";
   };
 
   outputs = inputs@{ logos-module-builder, ... }:
@@ -24,7 +30,13 @@
       };
 
       nixpkgs = logos-module-builder.inputs.nixpkgs;
-      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
+      lib = nixpkgs.lib;
+
+      # Native systems plus the "x86_64-windows" cross target.
+      systems = logos-module-builder.lib.common.systems;
+
+      # No tests for x86_64-windows: its Windows binaries cannot run on the Linux builder.
+      nativeSystems = builtins.filter (s: s != "x86_64-windows") systems;
 
       # Provide a custom tests package to build tests without in-build execution.
       testsPackage = system:
@@ -71,7 +83,7 @@
           name = system;
           value = { tests = { type = "app"; program = toString runner; }; };
         }
-      ) systems);
+      ) nativeSystems);
 
       existingApps = module.apps or {};
       mergedApps = builtins.listToAttrs (map (system: {
@@ -83,9 +95,10 @@
       # produces result/bin/{storage_module_tests,storage_module_integration_tests}.
       mergedPackages = builtins.listToAttrs (map (system: {
         name = system;
-        value = (module.packages.${system} or {}) // {
-          tests = testsPackage system;
-        };
+        value = (module.packages.${system} or {})
+          // lib.optionalAttrs (builtins.elem system nativeSystems) {
+               tests = testsPackage system;
+             };
       }) systems);
 
     in module // { apps = mergedApps; packages = mergedPackages; };

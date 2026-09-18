@@ -1,6 +1,7 @@
 #include "storage_module_plugin.h"
 
 #include <algorithm>
+#include "MixConfig.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -655,13 +656,15 @@ static void emitBasicResponse(StorageModuleImpl* impl, StorageEvent emit,
     emitJsonEvent(impl, emit, j, caller);
 }
 
+// `total` is fileSize on upload, the manifest's datasetSize on download.
 static void emitSessionProgress(StorageModuleImpl* impl, StorageEvent emit,
                                 const std::string& sessionId, int64_t bytes,
-                                const char* caller) {
+                                int64_t total, const char* caller) {
     json j;
     j["success"] = true;
     j["sessionId"] = sessionId;
     j["bytes"] = bytes;
+    j["total"] = total;
     emitJsonEvent(impl, emit, j, caller);
 }
 
@@ -744,7 +747,7 @@ struct ConnectCtx : AsyncCallbackBase {
 // On RET_PROGRESS: accumulates bytes and emits "storageUploadProgress" events
 // throttled to at most one per percentage point (max 100 events total) to avoid
 // flooding the caller.  When totalBytes is 0 (unknown), every event is forwarded.
-// JSON payload: {success:true, sessionId, bytes}
+// JSON payload: {success:true, sessionId, bytes, total}
 //
 // On RET_OK / error: emits "storageUploadDone".
 // JSON payload: {success, sessionId, cid} on success; {success:false, sessionId, error} on failure.
@@ -770,7 +773,7 @@ struct UploadFileCtx : AsyncCallbackBase {
                 lastEmittedPercent = percent;
             }
             emitSessionProgress(impl, &StorageModuleImpl::storageUploadProgress,
-                                sessionId, pendingBytes, "UploadFileCtx");
+                                sessionId, pendingBytes, totalBytes, "UploadFileCtx");
             pendingBytes = 0;
             return;
         }
@@ -819,7 +822,7 @@ struct UploadChunkCtx : AsyncCallbackBase {
 //   File mode (filepath non-empty):
 //     On RET_PROGRESS: accumulates bytes and emits "storageDownloadProgress"
 //     throttled to at most one event per percentage point to avoid flooding.
-//     JSON payload: {success:true, sessionId, bytes}
+//     JSON payload: {success:true, sessionId, bytes, total}
 //
 //   Both modes on completion:
 //     Emits "storageDownloadDone".
@@ -877,7 +880,8 @@ struct DownloadStreamCtx : AsyncCallbackBase {
                 }
                 emitSessionProgress(impl,
                                     &StorageModuleImpl::storageDownloadProgress,
-                                    cid, pendingBytes, "DownloadStreamCtx");
+                                    cid, pendingBytes, totalBytes,
+                                    "DownloadStreamCtx");
                 pendingBytes = 0;
             }
             return;
@@ -1775,8 +1779,16 @@ void StorageModuleImpl::settleLifecycleAction(const std::string& action,
 
 bool StorageModuleImpl::initializePrepared(const std::string& cfg,
                                             const LifecycleDispatch& dispatch) {
+    std::string config = cfg;
+    try {
+        json parsed = json::parse(cfg);
+        parsed.erase("config-version");
+        config = parsed.dump();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "StorageModuleImpl::init: config left as-is, %s\n", e.what());
+    }
     auto* sctx = new SyncCtx();
-    storageCtx = storage_new(cfg.c_str(), syncCallback, sctx);
+    storageCtx = storage_new(config.c_str(), syncCallback, sctx);
     const SyncResult result = waitSync(sctx, 1000);
     if (!result.ok || !storageCtx) {
         storageCtx = nullptr;
@@ -1859,6 +1871,204 @@ StdLogosResult StorageModuleImpl::destroyPrepared(const LifecycleDispatch& dispa
                           STORAGE_LIFECYCLE_NOT_INITIALIZED,
                           dispatch.previousState, false);
     return {false, {}, "Failed to destroy storage context."};
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+constexpr int configVersion = 3;
+
+namespace {
+
+std::string storageHome() {
+    const char* home = std::getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = std::getenv("USERPROFILE");
+#endif
+    if (!home || !*home) return {};
+
+    return (fs::path(home) / ".logos_storage").string();
+}
+
+// Legacy bootstrap nodes used in old version.
+// Those bootstrap should be replaced by network configuration.
+const char* const legacyBootstrapNodes[] = {
+    "spr:CiUIAhIhA-VlcoiRm02KyIzrcTP-ljFpzTljfBRRKTIvhMIwqBqWEgIDARpJCicAJQgCEiED5WVyiJGbTYrIjOtxM_6WMWnNOWN8FFEpMi-EwjCoGpYQs8n8wQYaCwoJBHTKubmRAnU6GgsKCQR0yrm5kQJ1OipHMEUCIQDwUNsfReB4ty7JFS5WVQ6n1fcko89qVAOfQEHixa03rgIgan2-uFNDT-r4s9TOkLe9YBkCbsRWYCHGGVJ25rLj0QE",
+    "spr:CiUIAhIhApIj9p6zJDRbw2NoCo-tj98Y760YbppRiEpGIE1yGaMzEgIDARpJCicAJQgCEiECkiP2nrMkNFvDY2gKj62P3xjvrRhumlGISkYgTXIZozMQvcz8wQYaCwoJBAWhF3WRAnVEGgsKCQQFoRd1kQJ1RCpGMEQCIFZB84O_nzPNuViqEGRL1vJTjHBJ-i5ZDgFL5XZxm4HAAiB8rbLHkUdFfWdiOmlencYVn0noSMRHzn4lJYoShuVzlw",
+    "spr:CiUIAhIhApqRgeWRPSXocTS9RFkQmwTZRG-Cdt7UR2N7POoz606ZEgIDARpJCicAJQgCEiECmpGB5ZE9JehxNL1EWRCbBNlEb4J23tRHY3s86jPrTpkQj8_8wQYaCwoJBAXfEfiRAnVOGgsKCQQF3xH4kQJ1TipGMEQCIGWJMsF57N1iIEQgTH7IrVOgEgv0J2P2v3jvQr5Cjy-RAiAy4aiZ8QtyDvCfl_K_w6SyZ9csFGkRNTpirq_M_QNgKw",
+};
+
+// Drop the bootstrap nodes this build no longer serves and keep the rest.
+json withoutLegacyBootstrap(const json& bootstrap) {
+    json kept = json::array();
+
+    for (const auto& node : bootstrap) {
+        if (!node.is_string()) {
+            // Should not happen: bootstrap nodes should be strings.
+            continue;
+        }
+
+        const std::string spr = node.get<std::string>();
+        bool isLegacy = false;
+
+        for (const char* legacy : legacyBootstrapNodes) {
+            if (spr == legacy) {
+                isLegacy = true;
+                break;
+            }
+        }
+
+        if (!isLegacy) {
+            kept.push_back(node);
+        }
+    }
+
+    return kept;
+}
+
+json mixConfiguration(const std::string& network) {
+    try {
+        const json config = json::parse(MIX_CONFIG_JSON);
+
+        if (!config.is_object() || !config.contains(network)) {
+            return json::object();
+        }
+
+        return config.at(network);
+    } catch (const std::exception&) {
+        return json::object();
+    }
+}
+
+// After NAT Traversal, nat options were reduced to "auto" or "extip:<address>"
+bool isLegacyNat(const json& nat) {
+    if (!nat.is_string()) {
+        return true;
+    }
+
+    const std::string value = nat.get<std::string>();
+    return value != "auto" && value.rfind("extip:", 0) != 0;
+}
+
+json migrateV0toV1(json obj) {
+    if (!obj.contains("bootstrap-node") || !obj["bootstrap-node"].is_array()) {
+        return obj;
+    }
+
+    const json kept = withoutLegacyBootstrap(obj["bootstrap-node"]);
+
+    if (kept.empty()) {
+        obj.erase("bootstrap-node");
+    } else {
+        obj["bootstrap-node"] = kept;
+    }
+
+    return obj;
+}
+
+json migrateV1toV2(json obj) {
+    if (!obj.contains("mix-enabled")) {
+        // Don't enable Mix by default on a custom bootstrap network.
+        obj["mix-enabled"] = !obj.contains("bootstrap-node") || obj["bootstrap-node"].empty();
+    }
+
+    if (!obj.contains("nat-schedule-interval")) {
+        // Shorter than libstorage's own default, for quicker NAT diagnostics.
+        obj["nat-schedule-interval"] = "60s";
+    }
+
+    if (obj.contains("nat") && isLegacyNat(obj["nat"])) {
+        obj.erase("nat");
+    }
+
+    return obj;
+}
+
+json migrateV2toV3(json obj) {
+    // Discovery moved from discv5 to the libp2p DHT: there is no UDP port left.
+    obj.erase("disc-port");
+
+    return obj;
+}
+
+json migrateConfigVersion(json obj) {
+    const int version = obj.value("config-version", 0);
+
+    if (version >= configVersion) {
+        return obj;
+    }
+
+    switch (version) {
+    case 0:
+        obj = migrateV0toV1(obj);
+        [[fallthrough]];
+    case 1:
+        obj = migrateV1toV2(obj);
+        [[fallthrough]];
+    case 2:
+        obj = migrateV2toV3(obj);
+    }
+
+    obj["config-version"] = configVersion;
+
+    return obj;
+}
+
+// Sync the Mix config from the network preset,
+// unless the user has provided a custom bootstrap list.
+//
+// If a network is passed in parameter and mix-enabled is true,
+// the Mix config is synced from the network preset.
+json syncMixConfig(json obj) {
+    if (!obj.value("mix-enabled", false)) {
+        return obj;
+    }
+
+    if (obj.contains("bootstrap-node") && !obj["bootstrap-node"].empty()) {
+        return obj;
+    }
+
+    const std::string network = obj.value("network", std::string("logos.test"));
+    const json mix = mixConfiguration(network);
+
+    if (mix.empty()) {
+        return obj;
+    }
+
+    obj["dht-mix-proxy"] = mix.value("dht-mix-proxy", json::array());
+    obj["mix-pool-json"] = mix.value("mix-pool-json", "");
+
+    return obj;
+}
+
+}
+
+StdLogosResult StorageModuleImpl::migrateConfig(const std::string& cfg) {
+    try {
+        json config = cfg.empty() ? json::object() : json::parse(cfg);
+
+        if (!config.is_object()) {
+            return {false, {}, "Invalid configuration: expected a JSON object."};
+        }
+
+        config = syncMixConfig(migrateConfigVersion(config));
+
+        if (!config.contains("data-dir")) {
+            // logos-storage-nim's own default differs per platform. One path keeps
+            // every consumer on the same repository.
+            const std::string home = storageHome();
+
+            if (home.empty()) {
+                return {false, {}, "Cannot resolve the storage home: HOME is not set."};
+            }
+
+            config["data-dir"] = (fs::path(home) / "data").string();
+        }
+
+        return {true, config.dump(), ""};
+    } catch (const std::exception& e) {
+        return {false, {}, std::string("Invalid configuration: ") + e.what()};
+    }
 }
 
 bool StorageModuleImpl::init(const std::string& cfg) {
@@ -2106,6 +2316,12 @@ StdLogosResult StorageModuleImpl::dataDir() {
     return {true, r.message, ""};
 }
 
+StdLogosResult StorageModuleImpl::network() {
+    auto r = syncCallNoArg(storageCtx, storage_network, 1000);
+    if (!r.ok) return {false, {}, r.message};
+    return {true, r.message, ""};
+}
+
 StdLogosResult StorageModuleImpl::peerId() {
     auto r = syncCallNoArg(storageCtx, storage_peer_id, 1000);
     if (!r.ok) return {false, {}, r.message};
@@ -2123,13 +2339,24 @@ StdLogosResult StorageModuleImpl::debug() {
     if (!r.ok) return {false, {}, r.message};
     try {
         auto parsed = json::parse(r.message);
-        // libstorage v0.4.2 renamed the provider-record field to
-        // `providerAddresses`. Keep the module's established
-        // `announceAddresses` contract for existing Inspector consumers.
-        if (parsed.is_object() && !parsed.contains("announceAddresses")) {
-            const auto providerAddresses = parsed.find("providerAddresses");
-            if (providerAddresses != parsed.end() && providerAddresses->is_array()) {
-                parsed["announceAddresses"] = *providerAddresses;
+        if (parsed.is_object()) {
+            // libstorage's DHT migration removed the provider/discovery address
+            // fields. Keep the module's established keys so older Inspector
+            // consumers can continue to parse the debug contract. Older
+            // libstorage versions still provide the real values.
+            if (!parsed.contains("providerAddresses")) {
+                parsed["providerAddresses"] = json::array();
+            }
+            if (!parsed.contains("discoveryAddresses")) {
+                parsed["discoveryAddresses"] = json::array();
+            }
+            if (!parsed.contains("announceAddresses")) {
+                const auto providerAddresses = parsed.find("providerAddresses");
+                if (providerAddresses != parsed.end() && providerAddresses->is_array()) {
+                    parsed["announceAddresses"] = *providerAddresses;
+                } else {
+                    parsed["announceAddresses"] = json::array();
+                }
             }
         }
         return {true, std::move(parsed), ""};

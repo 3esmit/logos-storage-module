@@ -180,7 +180,12 @@ static void ensureRestarted(const json& extraConfig = json::object()) {
     json cfg = {
         {"data-dir", g_dataDir.string()},
         {"log-level", "DEBUG"},
-        {"nat", "auto"},
+        // Integration tests exercise the local C ABI and filesystem paths;
+        // they do not require the public testnet bootstrap peers. Pin the
+        // node to a loopback-advertised, standalone network so CI does not
+        // depend on external DHT availability.
+        {"nat", "extip:127.0.0.1"},
+        {"no-bootstrap-node", true},
         {"log-file", logFile},
     };
     cfg.update(extraConfig);
@@ -329,6 +334,15 @@ LOGOS_TEST(integration_dataDir) {
     LOGOS_ASSERT_EQ(r.value.get<std::string>(), g_dataDir.string());
 }
 
+// integration_network
+
+LOGOS_TEST(integration_network) {
+    ensureRestarted({{"network", "logos.dev"}});
+    StdLogosResult r = g_impl->network();
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_EQ(r.value.get<std::string>(), "logos.dev");
+}
+
 // integration_peerId
 
 LOGOS_TEST(integration_peerId) {
@@ -350,6 +364,7 @@ LOGOS_TEST(integration_debug) {
     LOGOS_ASSERT_TRUE(r.value.contains("addrs"));
     LOGOS_ASSERT_TRUE(r.value.contains("providerAddresses"));
     LOGOS_ASSERT_TRUE(r.value.contains("announceAddresses"));
+    LOGOS_ASSERT_TRUE(r.value.contains("spr"));
     LOGOS_ASSERT_TRUE(r.value.contains("table"));
 }
 
@@ -646,4 +661,26 @@ LOGOS_TEST(integration_togglePrivateQueries_withMixEnabled) {
     StdLogosResult on = g_impl->togglePrivateQueries(true);
     LOGOS_ASSERT_TRUE(on.success);
     LOGOS_ASSERT_FALSE(on.value.get<bool>());
+}
+
+LOGOS_TEST(integration_init_accepts_a_migrated_config) {
+    fs::path dataDir = fs::temp_directory_path() /
+                       ("logos-storage-integration-test-" +
+                        std::to_string(
+                            std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    g_impl = new StorageModuleImpl();
+    g_waiter.install(g_impl);
+
+    const StdLogosResult migrated =
+        g_impl->migrateConfig(json{{"data-dir", dataDir.string()},
+                                   {"nat", "extip:127.0.0.1"}}.dump());
+
+    LOGOS_ASSERT_TRUE(migrated.success);
+    LOGOS_ASSERT_TRUE(json::parse(migrated.value.get<std::string>()).contains("config-version"));
+    LOGOS_ASSERT_TRUE(g_impl->init(migrated.value.get<std::string>()));
+
+    g_impl->destroy();
+    delete g_impl;
+    g_impl = nullptr;
 }

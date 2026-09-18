@@ -8,10 +8,9 @@ name: storage-module Doc-Tests
 #   - storage-module-mix.test.yaml: starts four Mix relays plus two storage nodes,
 #     builds the Mix relay pool, and routes an upload/download through Mix
 #     (asserts the SURB log).
-#   - storage-ui-app.test.yaml: builds the logos-storage-ui app against THIS
-#     commit and drives its real UI headless (onboarding, upload, download, stop,
-#     restart, delete).
-# Both run in one invocation so they share a single HTML report.
+#   - storage-module-config.test.yaml: migrates a configuration and ensures
+#     it is updated with the last changes of the module.
+# They run in one invocation so they share a single HTML report.
 #
 # ──────────────────────────────────────────────────────────────────────────────
 # One-time setup required for the clickable report links to work:
@@ -50,8 +49,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
-    # Generous: the storage-ui spec also builds the logos-storage-ui app, qt-mcp
-    # and libstorage, which on a cold cachix can take a while.
+    # Generous: the specs build the module and libstorage, which on a cold
+    # cachix can take a while.
     timeout-minutes: 150
 
     steps:
@@ -134,6 +133,7 @@ jobs:
           nix run github:logos-co/logos-doctest -- run \
             doctests/storage-module-runtime.test.yaml \
             doctests/storage-module-mix.test.yaml \
+            doctests/storage-module-config.test.yaml \
             --verbose \
             --continue-on-fail \
             --release-for logos-storage-module=${{ steps.commit.outputs.sha }} \
@@ -161,7 +161,7 @@ jobs:
 
       - name: Verify markdown generation
         run: |
-          for spec in storage-module-runtime storage-module-mix; do
+          for spec in storage-module-runtime storage-module-mix storage-module-config; do
             nix run github:logos-co/logos-doctest -- generate \
               "doctests/$spec.test.yaml" \
               --release-for logos-storage-module=${{ steps.commit.outputs.sha }} \
@@ -259,7 +259,7 @@ jobs:
               `${marker}\n` +
               `### 📊 storage-module doc-test report\n\n` +
               `This commit of the storage module, run through a logoscore daemon ` +
-              `(headless runtime) and through the real \`logos-storage-ui\` app — ` +
+              `(headless runtime) — ` +
               `rendered alongside the commands actually run and their output ` +
               `(updated each run, commit \`${context.sha.slice(0,7)}\`):\n\n` +
               `${links}\n\n` +

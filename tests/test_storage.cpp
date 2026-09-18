@@ -587,6 +587,20 @@ LOGOS_TEST(dataDir_returns_mocked_value) {
     delete impl;
 }
 
+LOGOS_TEST(network_returns_mocked_value) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+
+    t.mockCFunction("storage_network").returns("logos.test");
+    StdLogosResult r = impl->network();
+
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_EQ(r.value.get<std::string>(), std::string("logos.test"));
+
+    impl->destroy();
+    delete impl;
+}
+
 LOGOS_TEST(peerId_returns_failure_without_init) {
     auto t = LogosTestContext("storage_module");
     StorageModuleImpl impl;
@@ -600,13 +614,36 @@ LOGOS_TEST(debug_returns_parsed_map) {
     auto* impl = createInitializedImpl(t);
 
     t.mockCFunction("storage_debug")
-        .returns(R"({"id":"QmNode","addrs":[],"providerAddresses":[],"table":{}})");
+        .returns(R"({"id":"QmNode","addrs":[],"spr":"spr:AAAA","table":{}})");
     StdLogosResult r = impl->debug();
 
     LOGOS_ASSERT_TRUE(r.success);
     LOGOS_ASSERT_TRUE(r.value.is_object());
     LOGOS_ASSERT_FALSE(r.value.empty());
     LOGOS_ASSERT_TRUE(r.value.contains("id"));
+    LOGOS_ASSERT_TRUE(r.value.contains("providerAddresses"));
+    LOGOS_ASSERT_TRUE(r.value.contains("discoveryAddresses"));
+    LOGOS_ASSERT_TRUE(r.value.contains("announceAddresses"));
+    LOGOS_ASSERT_TRUE(r.value["providerAddresses"].is_array());
+    LOGOS_ASSERT_TRUE(r.value["discoveryAddresses"].is_array());
+    LOGOS_ASSERT_TRUE(r.value["announceAddresses"].is_array());
+
+    impl->destroy();
+    delete impl;
+}
+
+LOGOS_TEST(debug_preserves_legacy_provider_addresses) {
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+
+    t.mockCFunction("storage_debug").returns(
+        R"({"providerAddresses":["/ip4/127.0.0.1/tcp/8070"],"discoveryAddresses":[]})");
+    StdLogosResult r = impl->debug();
+
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_EQ(r.value["announceAddresses"].size(), std::size_t(1));
+    LOGOS_ASSERT_EQ(r.value["announceAddresses"][0].get<std::string>(),
+                    std::string("/ip4/127.0.0.1/tcp/8070"));
 
     impl->destroy();
     delete impl;
@@ -950,6 +987,29 @@ LOGOS_TEST(downloadCancel_returns_true) {
 
     LOGOS_ASSERT_TRUE(impl->downloadCancel("QmSomeCid").success);
     LOGOS_ASSERT(t.cFunctionCalled("storage_download_cancel"));
+
+    impl->destroy();
+    delete impl;
+}
+
+LOGOS_TEST(downloadToUrl_progress_reports_total_bytes) {
+    logos_test::EventCapture events;
+    auto t = LogosTestContext("storage_module");
+    auto* impl = createInitializedImpl(t);
+
+    t.mockCFunction("storage_download_manifest").returns(R"({"datasetSize":2048})");
+
+    StdLogosResult result = impl->downloadToUrl("QmSomeCid", "/tmp/logos-storage-test.bin",
+                                          false, 65536);
+
+    LOGOS_ASSERT_TRUE(result.success);
+
+    auto progress = events.all("storageDownloadProgress");
+    LOGOS_ASSERT_EQ(progress.size(), static_cast<size_t>(1));
+
+    // The total expected is the manifest datasetSize.
+    json payload = json::parse(progress[0].data);
+    LOGOS_ASSERT_EQ(payload["total"].get<int>(), 2048);
 
     impl->destroy();
     delete impl;
@@ -1667,4 +1727,226 @@ LOGOS_TEST(stop_emits_storageStop_event) {
 
     impl->destroy();
     delete impl;
+}
+
+static json migrated(StorageModuleImpl& impl, const json& config) {
+    const StdLogosResult r = impl.migrateConfig(config.dump());
+
+    if (!r.success || !r.value.is_string()) {
+        // An empty object on failure, so the assertion that follows fails on the field
+        // it was actually checking.
+        return json::object();
+    }
+
+    return json::parse(r.value.get<std::string>());
+}
+
+LOGOS_TEST(migrateConfig_fills_an_absent_data_dir) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json::object());
+
+    LOGOS_ASSERT_TRUE(out.contains("data-dir"));
+    LOGOS_ASSERT_TRUE(out["data-dir"].get<std::string>().find(".logos_storage") != std::string::npos);
+}
+
+LOGOS_TEST(migrateConfig_keeps_the_present_data_dir) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"data-dir", "/somewhere/else"}});
+
+    LOGOS_ASSERT_EQ(out["data-dir"].get<std::string>(), std::string("/somewhere/else"));
+}
+
+LOGOS_TEST(migrateConfig_stamps_the_schema_version) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    LOGOS_ASSERT_EQ(migrated(impl, json::object())["config-version"].get<int>(), 3);
+}
+
+LOGOS_TEST(migrateConfig_leaves_a_current_config_alone) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"config-version", 3}, {"nat", "extip:1.2.3.4"}});
+
+    LOGOS_ASSERT_EQ(out["nat"].get<std::string>(), std::string("extip:1.2.3.4"));
+}
+
+LOGOS_TEST(migrateConfig_drops_a_legacy_bootstrap_list) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"bootstrap-node", json::array({"spr:CiUIAhIhA-VlcoiRm02KyIzrcTP-ljFpzTljfBRRKTIvhMIwqBqWEgIDARpJCicAJQgCEiED5WVyiJGbTYrIjOtxM_6WMWnNOWN8FFEpMi-EwjCoGpYQs8n8wQYaCwoJBHTKubmRAnU6GgsKCQR0yrm5kQJ1OipHMEUCIQDwUNsfReB4ty7JFS5WVQ6n1fcko89qVAOfQEHixa03rgIgan2-uFNDT-r4s9TOkLe9YBkCbsRWYCHGGVJ25rLj0QE"})}});
+
+    LOGOS_ASSERT_FALSE(out.contains("bootstrap-node"));
+}
+
+LOGOS_TEST(migrateConfig_drops_an_empty_bootstrap_list) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"bootstrap-node", json::array()}});
+
+    LOGOS_ASSERT_FALSE(out.contains("bootstrap-node"));
+}
+
+LOGOS_TEST(migrateConfig_keeps_the_present_bootstrap_config_not_legacy) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"bootstrap-node", json::array({"spr:MINE"})}});
+
+    LOGOS_ASSERT_TRUE(out.contains("bootstrap-node"));
+    LOGOS_ASSERT_EQ(out["bootstrap-node"][0].get<std::string>(), std::string("spr:MINE"));
+}
+
+LOGOS_TEST(migrateConfig_drops_only_the_legacy_bootstrap_node) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl,
+        json{{"bootstrap-node", json::array({"spr:CiUIAhIhA-VlcoiRm02KyIzrcTP-ljFpzTljfBRRKTIvhMIwqBqWEgIDARpJCicAJQgCEiED5WVyiJGbTYrIjOtxM_6WMWnNOWN8FFEpMi-EwjCoGpYQs8n8wQYaCwoJBHTKubmRAnU6GgsKCQR0yrm5kQJ1OipHMEUCIQDwUNsfReB4ty7JFS5WVQ6n1fcko89qVAOfQEHixa03rgIgan2-uFNDT-r4s9TOkLe9YBkCbsRWYCHGGVJ25rLj0QE", "spr:MINE"})}});
+
+    LOGOS_ASSERT_EQ(out["bootstrap-node"].size(), 1u);
+    LOGOS_ASSERT_EQ(out["bootstrap-node"][0].get<std::string>(), std::string("spr:MINE"));
+}
+
+LOGOS_TEST(migrateConfig_turns_mix_on_when_the_mix_config_is_absent) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    LOGOS_ASSERT_TRUE(migrated(impl, json::object())["mix-enabled"].get<bool>());
+}
+
+LOGOS_TEST(migrateConfig_leaves_mix_off_on_a_private_network) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"bootstrap-node", json::array({"spr:MINE"})}});
+
+    LOGOS_ASSERT_FALSE(out["mix-enabled"].get<bool>());
+}
+
+LOGOS_TEST(migrateConfig_leaves_mix_value_when_the_mix_config_is_present) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    LOGOS_ASSERT_FALSE(migrated(impl, json{{"mix-enabled", false}})["mix-enabled"].get<bool>());
+}
+
+LOGOS_TEST(migrateConfig_drops_an_invalid_nat_value) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"nat", "any"}});
+
+    LOGOS_ASSERT_FALSE(out.contains("nat"));
+}
+
+LOGOS_TEST(migrateConfig_keeps_a_valid_nat) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    LOGOS_ASSERT_EQ(migrated(impl, json{{"nat", "auto"}})["nat"].get<std::string>(),
+                    std::string("auto"));
+    LOGOS_ASSERT_EQ(migrated(impl, json{{"nat", "extip:1.2.3.4"}})["nat"].get<std::string>(),
+                    std::string("extip:1.2.3.4"));
+}
+
+LOGOS_TEST(migrateConfig_drops_the_disc_port) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"config-version", 2}, {"disc-port", 8090}});
+
+    LOGOS_ASSERT_FALSE(out.contains("disc-port"));
+}
+
+LOGOS_TEST(migrateConfig_fills_the_mix_configuration_of_the_network) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"network", "logos.dev"}});
+
+    LOGOS_ASSERT_FALSE(out["dht-mix-proxy"].empty());
+    LOGOS_ASSERT_FALSE(out["mix-pool-json"].get<std::string>().empty());
+}
+
+LOGOS_TEST(migrateConfig_replaces_stale_mix_configuration) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"dht-mix-proxy", json::array({"stale"})}});
+
+    LOGOS_ASSERT_TRUE(out["dht-mix-proxy"] != json::array({"stale"}));
+}
+
+LOGOS_TEST(migrateConfig_leaves_mix_alone_when_mix_is_off) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"config-version", 3}, {"mix-enabled", false}});
+
+    LOGOS_ASSERT_FALSE(out.contains("dht-mix-proxy"));
+}
+
+LOGOS_TEST(migrateConfig_leaves_mix_alone_on_a_private_network) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"bootstrap-node", json::array({"spr:MINE"})},
+                                          {"dht-mix-proxy", json::array({"theirs"})}});
+
+    LOGOS_ASSERT_EQ(out["dht-mix-proxy"], json::array({"theirs"}));
+}
+
+LOGOS_TEST(migrateConfig_leaves_mix_alone_on_an_unknown_network) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json out = migrated(impl, json{{"network", "logos.nowhere"}});
+
+    LOGOS_ASSERT_FALSE(out.contains("dht-mix-proxy"));
+}
+
+LOGOS_TEST(migrateConfig_produces_same_output_on_repeated_calls) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    const json once = migrated(impl, json{{"nat", "any"}});
+    const json twice = migrated(impl, once);
+
+    LOGOS_ASSERT_TRUE(once == twice);
+}
+
+LOGOS_TEST(migrateConfig_reports_a_mistyped_config_version) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    StdLogosResult r = impl.migrateConfig(json{{"config-version", "2"}}.dump());
+
+    LOGOS_ASSERT_FALSE(r.success);
+}
+
+LOGOS_TEST(migrateConfig_reports_a_mistyped_mix_enabled) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    StdLogosResult r =
+        impl.migrateConfig(json{{"config-version", 3}, {"mix-enabled", "yes"}}.dump());
+
+    LOGOS_ASSERT_FALSE(r.success);
+}
+
+LOGOS_TEST(migrateConfig_reports_invalid_json) {
+    auto t = LogosTestContext("storage_module");
+    StorageModuleImpl impl;
+
+    StdLogosResult r = impl.migrateConfig("{ not json");
+
+    LOGOS_ASSERT_FALSE(r.success);
 }

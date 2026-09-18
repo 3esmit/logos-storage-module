@@ -8,7 +8,7 @@
   };
 
   inputs = {
-    logos-module-builder.url = "github:3esmit/logos-module-builder?rev=c43e19d297c22513ce7b51f143c1f4217be794f7";
+    logos-module-builder.url = "github:3esmit/logos-module-builder?rev=39b159144aa37f4000cfbbb1c348a8479ee0864e";
     logos-storage.url = "git+https://github.com/3esmit/logos-storage-nim?submodules=1&rev=21a00ace2e03811c9bf4dfc9ba4688ad6e1cbd00";
   };
 

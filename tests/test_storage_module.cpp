@@ -180,7 +180,12 @@ static void ensureRestarted(const json& extraConfig = json::object()) {
     json cfg = {
         {"data-dir", g_dataDir.string()},
         {"log-level", "DEBUG"},
-        {"nat", "auto"},
+        // Integration tests exercise the local C ABI and filesystem paths;
+        // they do not require the public testnet bootstrap peers. Pin the
+        // node to a loopback-advertised, standalone network so CI does not
+        // depend on external DHT availability.
+        {"nat", "extip:127.0.0.1"},
+        {"no-bootstrap-node", true},
         {"log-file", logFile},
     };
     cfg.update(extraConfig);

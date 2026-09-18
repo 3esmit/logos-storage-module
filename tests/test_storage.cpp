@@ -458,14 +458,14 @@ LOGOS_TEST(nodeAction_rejects_malformed_requests_without_dispatch) {
     LOGOS_ASSERT_TRUE(events.all("nodeChanged").empty());
 }
 
-// version
+// libstorageVersion
 
-LOGOS_TEST(version_returns_mocked_string) {
+LOGOS_TEST(libstorageVersion_returns_mocked_string) {
     auto t = LogosTestContext("storage_module");
     auto* impl = createInitializedImpl(t);
 
     t.mockCFunction("storage_version").returns("1.2.3-test");
-    StdLogosResult vr = impl->version();
+    StdLogosResult vr = impl->libstorageVersion();
 
     LOGOS_ASSERT_TRUE(vr.success);
     LOGOS_ASSERT_EQ(vr.value.get<std::string>(), std::string("1.2.3-test"));

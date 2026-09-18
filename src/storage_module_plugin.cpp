@@ -1917,7 +1917,7 @@ StdLogosResult StorageModuleImpl::destroy() {
 // Info
 // ---------------------------------------------------------------------------
 
-StdLogosResult StorageModuleImpl::version() {
+StdLogosResult StorageModuleImpl::libstorageVersion() {
     if (!storageCtx)
         return {false, {}, "Storage context not initialized."};
     char* v = storage_version(storageCtx);
